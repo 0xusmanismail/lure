@@ -1,0 +1,25 @@
+# FILE: pyproject.toml
+# ─────────────────────────────────────────────────────────────────────────────
+
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "lure"
+version         = "0.1.0"
+description     = "Local Linux binary analysis tool for security researchers and CTF players"
+requires-python = ">=3.9"
+license         = { text = "MIT" }
+dependencies    = [
+    "click>=8.1",
+    "rich>=13.7",
+    "pyelftools>=0.30",
+]
+
+[project.scripts]
+lure = "lure.main:cli"
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["lure*"]

@@ -1,0 +1,4 @@
+# FILE: requirements.txt
+click>=8.1
+rich>=13.7
+pyelftools>=0.30
