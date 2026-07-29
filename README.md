@@ -6,17 +6,18 @@
 `diff`) work end to end on x86_64 Linux. This is a young project —
 expect rough edges, limited error handling on unusual inputs, and
 missing features. Bug reports, feedback, and contributions are very
-welcome.
+welcome. Network isolation is enforced. Filesystem isolation is
+not — run inside a VM when analyzing untrusted samples.
 
 ![Lure dangerous verdict](assets/dangerous-3.png)
 
 ## What it does
 
-Lure runs an untrusted Linux binary inside an isolated sandbox
-(Linux namespaces + strace) and tells you exactly what it did —
-which files it touched, what network connections it tried, what
-processes it spawned — then gives you a plain verdict:
-**CLEAN**, **SUSPICIOUS**, or **DANGEROUS**.
+Lure runs an untrusted Linux binary in a lightweight monitoring
+environment (user + network namespaces + strace) and tells you
+exactly what it did — which files it touched, what network
+connections it tried, what processes it spawned — then gives you a
+plain verdict: **CLEAN**, **SUSPICIOUS**, or **DANGEROUS**.
 
 Everything happens on your machine. Nothing is uploaded anywhere.
 
@@ -26,6 +27,15 @@ Everything happens on your machine. Nothing is uploaded anywhere.
 - **Zero setup** — no VM, no Docker, no Cuckoo install process
 - **Readable** — structured reports instead of raw strace noise
 - **Free** — MIT licensed, runs on tools already on Kali Linux
+
+## Isolation model
+
+Lure uses Linux user and network namespaces to prevent the binary
+from making outbound network connections. The host filesystem
+remains visible to the analyzed binary. For stronger isolation
+(mount namespace, seccomp, cgroups), run Lure inside a VM or
+container. Lure is primarily a behavioral observation tool, not a
+hardened sandbox.
 
 ## Install
 

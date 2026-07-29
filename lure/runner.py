@@ -34,23 +34,33 @@ console = Console(record=True)
 
 # ── Sensitivity classification ─────────────────────────────────────────────────
 #
-# Three tiers, checked in this order:
+# Four tiers, checked in this order:
 #
 #   1. _NEVER_SENSITIVE_*  — hard overrides. Normal dynamic-linker,
 #      locale, and SELinux bookkeeping that happens on EVERY single
 #      program launch. These must NEVER be flagged, no matter what.
 #
-#   2. _SENSITIVE_WRITE_ONLY — flagged ONLY when the access is a
-#      write/modify. /etc/ld.so.preload is READ (and usually ENOENT)
-#      by the dynamic linker on every launch — totally normal. A
-#      WRITE to it is a classic LD_PRELOAD persistence technique.
+#   2. _SENSITIVE_WRITE_ONLY_* — flagged ONLY when the access is a
+#      write/modify:
+#        - /etc/ld.so.preload is READ (and usually ENOENT) by the
+#          dynamic linker on every launch — totally normal. A WRITE
+#          to it is a classic LD_PRELOAD persistence technique.
+#        - /home/ is read constantly by normal tools (dotfiles,
+#          configs). A WRITE under /home/ is more meaningful.
 #
-#   3. _SENSITIVE_EXACT / _SENSITIVE_PREFIX — always sensitive,
+#   3. _SENSITIVE_READ_LIGHT_* — NOT flagged on its own. Reading
+#      /etc/passwd is completely normal (glibc, `ls -l`, every shell
+#      prompt does it). It only becomes a "confirmed sensitive"
+#      access if the same run also attempted a network connection —
+#      i.e. read-credentials-then-phone-home. See the second pass in
+#      _parse_full_trace() that upgrades these once network activity
+#      is known.
+#
+#   4. _SENSITIVE_EXACT / _SENSITIVE_PREFIX — always sensitive,
 #      regardless of read or write.
 #
 
 _SENSITIVE_EXACT = frozenset({
-    '/etc/passwd',
     '/etc/shadow',
     '/etc/sudoers',
     '/etc/crontab',
@@ -61,17 +71,26 @@ _SENSITIVE_PREFIX = (
     '/.ssh/',
     '/etc/cron.d/',
     '/proc/net/',
+)
+
+_SENSITIVE_WRITE_ONLY_EXACT = frozenset({
+    '/etc/ld.so.preload',
+})
+
+_SENSITIVE_WRITE_ONLY_PREFIX = (
     '/home/',
 )
 
-_SENSITIVE_WRITE_ONLY = frozenset({
-    '/etc/ld.so.preload',
+# Flagged only in combination with outbound network activity elsewhere
+# in the same run — never on their own. See _parse_full_trace().
+_SENSITIVE_READ_LIGHT_EXACT = frozenset({
+    '/etc/passwd',
 })
 
 # Hard "never flag" overrides — accessed by virtually every binary on
 # every launch as part of normal dynamic linking / locale / SELinux
 # startup checks. NOTE: /etc/ld.so.preload is deliberately NOT listed
-# here — it lives only in _SENSITIVE_WRITE_ONLY above, so a read
+# here — it lives only in _SENSITIVE_WRITE_ONLY_EXACT above, so a read
 # (the normal case) is never flagged but a write still is.
 _NEVER_SENSITIVE_EXACT = frozenset({
     '/etc/ld.so.cache',
@@ -119,8 +138,41 @@ _ALWAYS_WRITE_SYSCALLS = frozenset({
 
 _MAX_FILE_ROWS = 40
 _MAX_PROC_ROWS = 20
+_MAX_OUTPUT_LINES  = 50
+_OUTPUT_HEAD_LINES = 25
+_OUTPUT_TAIL_LINES = 25
 
 _REPORTS_DIR = os.path.expanduser('~/.lure/reports')
+
+
+def _read_program_output(path):
+    """
+    Read the binary's captured stdout+stderr (merged, in real
+    chronological order) from `path`.
+
+    Returns a list of display lines, already truncated to at most
+    _MAX_OUTPUT_LINES (first 25 / last 25 + an omitted-count marker
+    if the output is longer), or None if there was no output at all.
+    """
+    try:
+        with open(path, 'r', errors='replace') as f:
+            text = f.read()
+    except OSError:
+        text = ''
+
+    if not text.strip():
+        return None
+
+    lines = text.splitlines()
+    if len(lines) <= _MAX_OUTPUT_LINES:
+        return lines
+
+    omitted = len(lines) - (_OUTPUT_HEAD_LINES + _OUTPUT_TAIL_LINES)
+    return (
+        lines[:_OUTPUT_HEAD_LINES]
+        + [f'[... {omitted} lines omitted ...]']
+        + lines[-_OUTPUT_TAIL_LINES:]
+    )
 
 
 # ── Path / access helpers ─────────────────────────────────────────────────────
@@ -136,21 +188,36 @@ def _is_write_access(syscall, raw):
 
 def _could_be_sensitive(path):
     """
-    True if `path` matches ANY sensitivity rule, ignoring write-status.
-    Used so genuinely sensitive paths under /proc/ (e.g. /proc/net/)
-    are never discarded by the generic noise filter.
+    True if `path` matches ANY sensitivity rule, ignoring write-status
+    and the read-light network condition. Used so genuinely sensitive
+    paths under /proc/ (e.g. /proc/net/) are never discarded by the
+    generic noise filter.
     """
     if path in _NEVER_SENSITIVE_EXACT:
         return False
     if any(path.startswith(p) for p in _NEVER_SENSITIVE_PREFIX):
         return False
-    if path in _SENSITIVE_EXACT or path in _SENSITIVE_WRITE_ONLY:
+    if path in _SENSITIVE_EXACT or path in _SENSITIVE_WRITE_ONLY_EXACT:
         return True
-    return any(path.startswith(p) for p in _SENSITIVE_PREFIX)
+    if path in _SENSITIVE_READ_LIGHT_EXACT:
+        return True
+    if any(path.startswith(p) for p in _SENSITIVE_PREFIX):
+        return True
+    return any(path.startswith(p) for p in _SENSITIVE_WRITE_ONLY_PREFIX)
+
+
+def _is_read_light(path):
+    """True if `path` is only conditionally sensitive (see tier 3 above)."""
+    return path in _SENSITIVE_READ_LIGHT_EXACT
 
 
 def _is_sensitive(path, is_write):
-    """Final SENSITIVE classification for one file-access event."""
+    """
+    Provisional per-event SENSITIVE classification for one file-access
+    event. Read-light paths (e.g. /etc/passwd) always come back False
+    here — they're upgraded later in _parse_full_trace() only if the
+    run also attempted a network connection.
+    """
     # Hard overrides always win, regardless of read/write.
     if path in _NEVER_SENSITIVE_EXACT:
         return False
@@ -158,8 +225,14 @@ def _is_sensitive(path, is_write):
         return False
 
     # Write-gated: sensitive ONLY when actually written to.
-    if path in _SENSITIVE_WRITE_ONLY:
+    if path in _SENSITIVE_WRITE_ONLY_EXACT:
         return is_write
+    if any(path.startswith(p) for p in _SENSITIVE_WRITE_ONLY_PREFIX):
+        return is_write
+
+    # Read-light: never sensitive on its own.
+    if path in _SENSITIVE_READ_LIGHT_EXACT:
+        return False
 
     # Always-sensitive.
     if path in _SENSITIVE_EXACT:
@@ -224,11 +297,12 @@ def _classify(parsed):
                 return None
             is_write = _is_write_access(sc, raw)
             return {
-                'type':      'file',
-                'path':      path,
-                'sensitive': _is_sensitive(path, is_write),
-                'write':     is_write,
-                'retval':    rv,
+                'type':       'file',
+                'path':       path,
+                'sensitive':  _is_sensitive(path, is_write),
+                'read_light': _is_read_light(path),
+                'write':      is_write,
+                'retval':     rv,
             }
 
     # ── Exec events ───────────────────────────────────────────────────────────
@@ -383,9 +457,20 @@ def _parse_full_trace(trace_path):
                     p = evt['path']
                     if p not in file_index:
                         file_index[p] = len(files)
-                        files.append({'path': p, 'sensitive': evt['sensitive']})
-                    elif evt['sensitive']:
-                        files[file_index[p]]['sensitive'] = True
+                        files.append({
+                            'path':       p,
+                            'sensitive':  evt['sensitive'],
+                            'write':      evt['write'],
+                            'read_light': evt['read_light'],
+                        })
+                    else:
+                        entry = files[file_index[p]]
+                        if evt['sensitive']:
+                            entry['sensitive'] = True
+                        if evt['write']:
+                            entry['write'] = True
+                        if evt['read_light']:
+                            entry['read_light'] = True
 
                 elif evt['type'] == 'exec':
                     cmd = evt['cmd']
@@ -406,6 +491,14 @@ def _parse_full_trace(trace_path):
     except (FileNotFoundError, OSError):
         pass
 
+    # Read-light paths (e.g. /etc/passwd) are only "confirmed sensitive"
+    # if this run also attempted an outbound network connection —
+    # otherwise a read of them alone is normal and stays unflagged.
+    if network:
+        for f in files:
+            if f['read_light']:
+                f['sensitive'] = True
+
     return {
         'files':     files,
         'network':   network,
@@ -423,25 +516,32 @@ def _verdict(events):
     and triggers is a list of exact "<what> (<why>)" strings that caused it
     (empty for CLEAN).
 
-    DANGEROUS  = /etc/shadow accessed
-               OR /.ssh/ accessed
-               OR (sensitive files AND network)
-    SUSPICIOUS = sensitive files accessed
-               OR network connections attempted
+    DANGEROUS  = /etc/shadow accessed (any)
+               OR /.ssh/ accessed (any)
+               OR (confirmed-sensitive WRITE + network)
+    SUSPICIOUS = confirmed-sensitive file access
+               OR outbound network connection attempt
     CLEAN      = neither
+
+    "Confirmed-sensitive" here means events['files'] entries with
+    sensitive=True — which already excludes plain reads of read-light
+    paths (e.g. /etc/passwd) unless this run also had network activity
+    (see the upgrade pass in _parse_full_trace()).
     """
-    sensitive_files = [e['path'] for e in events['files'] if e['sensitive']]
-    networks        = events['network']
+    sensitive_entries = [e for e in events['files'] if e['sensitive']]
+    sensitive_paths   = [e['path'] for e in sensitive_entries]
+    networks          = events['network']
 
-    has_shadow    = any('/etc/shadow' in p for p in sensitive_files)
-    has_ssh       = any('/.ssh/'      in p for p in sensitive_files)
-    has_sensitive = bool(sensitive_files)
-    has_network   = bool(networks)
+    has_shadow          = any('/etc/shadow' in p for p in sensitive_paths)
+    has_ssh             = any('/.ssh/'      in p for p in sensitive_paths)
+    has_sensitive       = bool(sensitive_paths)
+    has_network         = bool(networks)
+    has_sensitive_write = any(e['write'] for e in sensitive_entries)
 
-    triggers  = [f'{p} (sensitive file access)' for p in sensitive_files]
+    triggers  = [f'{p} (sensitive file access)' for p in sensitive_paths]
     triggers += [f'{n["ip"]}:{n["port"]} (network connection)' for n in networks]
 
-    if has_shadow or has_ssh or (has_sensitive and has_network):
+    if has_shadow or has_ssh or (has_sensitive_write and has_network):
         return 'DANGEROUS', triggers
     if has_sensitive or has_network:
         return 'SUSPICIOUS', triggers
@@ -450,8 +550,8 @@ def _verdict(events):
 
 # ── Report renderer ───────────────────────────────────────────────────────────
 
-def _render_report(binary_path, exit_code, elapsed, timed_out, events):
-    """Print all six report sections after the binary exits."""
+def _render_report(binary_path, exit_code, elapsed, timed_out, events, program_output):
+    """Print all report sections after the binary exits."""
 
     total_sc = sum(events['syscalls'].values())
 
@@ -481,7 +581,27 @@ def _render_report(binary_path, exit_code, elapsed, timed_out, events):
         padding=(0, 1),
     ))
 
-    # ── 2. Files Accessed ─────────────────────────────────────────────────────
+    # ── 2. Program Output ─────────────────────────────────────────────────────
+    output_lines = _read_program_output(program_output) if program_output else None
+
+    if output_lines is None:
+        output_body = Text('  (no output)', style='dim italic')
+    else:
+        ot = Table(box=None, show_header=False, show_edge=False, padding=(0, 0))
+        ot.add_column()
+        for line in output_lines:
+            ot.add_row(Text(f'  {line}', style='white'))
+        output_body = ot
+
+    console.print(Panel(
+        output_body,
+        title='[bold]Program Output[/bold]',
+        border_style='dim white',
+        box=box.ROUNDED,
+        padding=(0, 1),
+    ))
+
+    # ── 3. Files Accessed ─────────────────────────────────────────────────────
     files           = events['files']
     sensitive_count = sum(1 for e in files if e['sensitive'])
 
@@ -517,7 +637,7 @@ def _render_report(binary_path, exit_code, elapsed, timed_out, events):
         padding=(0, 1),
     ))
 
-    # ── 3. Network Activity ───────────────────────────────────────────────────
+    # ── 4. Network Activity ───────────────────────────────────────────────────
     network = events['network']
     if not network:
         net_body = Text('  (no network connections attempted)', style='dim italic')
@@ -549,7 +669,7 @@ def _render_report(binary_path, exit_code, elapsed, timed_out, events):
         padding=(0, 1),
     ))
 
-    # ── 4. Processes Spawned ──────────────────────────────────────────────────
+    # ── 5. Processes Spawned ──────────────────────────────────────────────────
     procs = events['processes']
     if not procs:
         proc_body = Text('  (no child processes spawned)', style='dim italic')
@@ -568,7 +688,7 @@ def _render_report(binary_path, exit_code, elapsed, timed_out, events):
         padding=(0, 1),
     ))
 
-    # ── 5. Syscall Summary ────────────────────────────────────────────────────
+    # ── 6. Syscall Summary ────────────────────────────────────────────────────
     top5    = sorted(events['syscalls'].items(), key=lambda x: x[1], reverse=True)[:5]
     max_cnt = top5[0][1] if top5 else 1
 
@@ -601,7 +721,7 @@ def _render_report(binary_path, exit_code, elapsed, timed_out, events):
         padding=(0, 1),
     ))
 
-    # ── 6. Verdict ────────────────────────────────────────────────────────────
+    # ── 7. Verdict ────────────────────────────────────────────────────────────
     label, triggers = _verdict(events)
 
     if label == 'CLEAN':
@@ -714,7 +834,7 @@ def _save_report(binary_path, exit_code, elapsed, timed_out, events, label, trig
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
-def _execute(binary_path, timeout, binary_args, allow_net, trace_out, tmp_trace, save):
+def _execute(binary_path, timeout, binary_args, allow_net, trace_out, tmp_trace, tmp_output, save):
     """Build command, run it, stream live feed, render report, optionally save."""
 
     binary_argv = shlex.split(binary_args) if binary_args.strip() else []
@@ -753,13 +873,18 @@ def _execute(binary_path, timeout, binary_args, allow_net, trace_out, tmp_trace,
     console.print()
 
     # ── Launch ─────────────────────────────────────────────────────────────────
+    # stdout/stderr are captured to a real file (not subprocess.PIPE) so a
+    # chatty binary can never deadlock us by filling an unread pipe buffer.
+    # stderr is redirected to the same fd as stdout so the two streams stay
+    # in true chronological order, exactly like a shell's `2>&1`.
     start_time = time.time()
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        with open(tmp_output, 'wb') as out_f:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=out_f,
+                stderr=subprocess.STDOUT,
+            )
     except FileNotFoundError as exc:
         console.print(f'[red]Launch failed:[/red] {exc}')
         return
@@ -810,7 +935,9 @@ def _execute(binary_path, timeout, binary_args, allow_net, trace_out, tmp_trace,
 
     # ── Full report ────────────────────────────────────────────────────────────
     events = _parse_full_trace(tmp_trace)
-    label, triggers = _render_report(binary_path, exit_code, elapsed, timed_out, events)
+    label, triggers = _render_report(
+        binary_path, exit_code, elapsed, timed_out, events, tmp_output
+    )
 
     # ── Save report ───────────────────────────────────────────────────────────
     if save:
@@ -857,6 +984,11 @@ def run_binary(binary, timeout, binary_args, allow_net, trace_out, save=False):
         console.print(f'[red]Error:[/red] {binary_path} — file not found')
         return
 
+    if not os.access(binary_path, os.X_OK):
+        console.print(f'[red]Error:[/red] file is not executable: {binary_path}')
+        console.print(f'[dim]Tip:[/dim] run chmod +x {binary_path} to make it executable')
+        return
+
     if not is_elf_file(binary_path):
         console.print(f'[red]{NOT_ELF_ERROR}[/red]')
         return
@@ -876,8 +1008,15 @@ def run_binary(binary, timeout, binary_args, allow_net, trace_out, save=False):
     fd, tmp_trace = tempfile.mkstemp(prefix='lure_', suffix='.trace')
     os.close(fd)
 
+    # Temp file for the binary's own captured stdout+stderr
+    fd, tmp_output = tempfile.mkstemp(prefix='lure_out_', suffix='.log')
+    os.close(fd)
+
     try:
-        _execute(binary_path, timeout, binary_args, allow_net, trace_out, tmp_trace, save)
+        _execute(
+            binary_path, timeout, binary_args, allow_net,
+            trace_out, tmp_trace, tmp_output, save,
+        )
     finally:
         if trace_out:
             try:
@@ -886,5 +1025,11 @@ def run_binary(binary, timeout, binary_args, allow_net, trace_out, save=False):
                 pass
         try:
             os.unlink(tmp_trace)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp_output)
+        except OSError:
+            pass
         except OSError:
             pass
