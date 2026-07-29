@@ -5,8 +5,6 @@ Lure CLI — entry point and subcommand definitions.
 
 import click
 from rich.console import Console
-from rich.panel import Panel
-from rich import box
 
 console = Console()
 
@@ -26,7 +24,7 @@ CONTEXT_SETTINGS = dict(help_option_names=['--help', '-h'])
 
 
 @click.group(context_settings=CONTEXT_SETTINGS)
-@click.version_option(version='0.1.0', prog_name='lure')
+@click.version_option(version='0.2.0', prog_name='lure')
 def cli():
     """
     \b
@@ -85,7 +83,7 @@ def inspect(binary, output_json, show_sections, show_strings):
               help='Allow outbound network access inside the sandbox (off by default).')
 @click.option('--out', 'trace_out', default=None, metavar='FILE',
               type=click.Path(dir_okay=False),
-              help="Save the raw strace log to FILE for later use with 'lure report'.")
+              help='Save the raw strace log to FILE for later inspection.')
 @click.option('--save', 'save_report', is_flag=True, default=False,
               help='Save the full rendered report to ~/.lure/reports/<binary>_<timestamp>.txt')
 def run(binary, timeout, binary_args, allow_net, trace_out, save_report):
@@ -114,42 +112,26 @@ def run(binary, timeout, binary_args, allow_net, trace_out, save_report):
     run_binary(binary, timeout, binary_args, allow_net, trace_out, save_report)
 
 
-# ── report ─────────────────────────────────────────────────────────────────────
+# ── diff ───────────────────────────────────────────────────────────────────────
 
 @cli.command()
-@click.argument('trace_file', type=click.Path(exists=True, readable=True))
-@click.option('--format', 'fmt',
-              type=click.Choice(['terminal', 'json', 'html'], case_sensitive=False),
-              default='terminal', show_default=True, help='Output format.')
-@click.option('--filter', 'event_filter',
-              type=click.Choice(['all', 'files', 'network', 'processes', 'signals'],
-                                case_sensitive=False),
-              default='all', show_default=True, help='Show only this event category.')
-@click.option('--out', 'output_file', default=None, metavar='FILE',
-              type=click.Path(dir_okay=False),
-              help='Write the report to FILE (required for --format json/html).')
-def report(trace_file, fmt, event_filter, output_file):
-    """Render a human-readable report from a saved strace trace file.
+@click.argument('report1', type=click.Path(exists=True, readable=True))
+@click.argument('report2', type=click.Path(exists=True, readable=True))
+def diff(report1, report2):
+    """Compare two saved JSON reports and show what changed between runs.
 
     \b
-    TRACE_FILE  Path to a .trace file produced by 'lure run --out'.
+    REPORT1  Path to the earlier .json report (produced by 'lure run --save').
+    REPORT2  Path to the later .json report.
 
     \b
     Examples:
     \b
-      lure report run.trace
-      lure report run.trace --filter network
-      lure report run.trace --format json --out report.json
-      lure report run.trace --format html  --out report.html
+      lure diff ~/.lure/reports/a.json ~/.lure/reports/b.json
     """
+    from lure.diff import run_diff
     print_banner()
-    console.print(Panel.fit(
-        f'[bold green]REPORT[/bold green]  [white]{trace_file}[/white]\n'
-        f'  [dim]format[/dim] {fmt}   [dim]filter[/dim] {event_filter}   '
-        f'[dim]out →[/dim] {output_file or "stdout"}',
-        border_style='green', box=box.ROUNDED,
-    ))
-    console.print('  [yellow]→ Report command coming soon.[/yellow]\n')
+    run_diff(report1, report2)
 
 
 if __name__ == '__main__':

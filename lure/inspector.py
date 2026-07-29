@@ -25,6 +25,21 @@ from rich import box
 console = Console()
 
 
+# ── ELF validation ────────────────────────────────────────────────────────────
+
+ELF_MAGIC     = b'\x7fELF'
+NOT_ELF_ERROR = 'Error: not a valid ELF binary. Lure only supports Linux ELF files.'
+
+
+def is_elf_file(filepath: str) -> bool:
+    """True if the first 4 bytes of `filepath` match the ELF magic number."""
+    try:
+        with open(filepath, 'rb') as f:
+            return f.read(4) == ELF_MAGIC
+    except OSError:
+        return False
+
+
 # ── Lookup tables ─────────────────────────────────────────────────────────────
 
 ARCH_MAP = {
@@ -397,6 +412,10 @@ def run_inspect(
         console.print(f'[red]Error:[/red] file not found: {filepath}')
         return
 
+    if not is_elf_file(filepath):
+        console.print(f'[red]{NOT_ELF_ERROR}[/red]')
+        return
+
     # ── File metadata (no ELF parsing needed yet) ──────────────────────────────
     st          = path.stat()
     size_bytes  = st.st_size
@@ -427,8 +446,8 @@ def run_inspect(
             upx      = _check_upx(elf, filepath)
             sections = _get_sections_data(elf) if show_sections else []
 
-    except Exception as exc:
-        console.print(f'[red]ELF parse error:[/red] {exc}')
+    except Exception:
+        console.print(f'[red]{NOT_ELF_ERROR}[/red]')
         return
 
     strings = _extract_strings(filepath) if show_strings else []

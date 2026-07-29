@@ -7,10 +7,12 @@ Combines strace (syscall capture) with unshare
 
 import os
 import re
+import json
 import time
 import shlex
 import shutil
 import tempfile
+import datetime
 import threading
 import subprocess
 from pathlib import Path
@@ -21,6 +23,8 @@ from rich.table import Table
 from rich.text import Text
 from rich.rule import Rule
 from rich import box
+
+from lure.inspector import is_elf_file, NOT_ELF_ERROR
 
 # record=True lets us export the full rendered transcript to a text
 # file for 'lure run --save', while still printing to the terminal
@@ -415,7 +419,9 @@ def _parse_full_trace(trace_path):
 def _verdict(events):
     """
     Compute the final verdict.
-    Returns (label, reason) where label is CLEAN | SUSPICIOUS | DANGEROUS.
+    Returns (label, triggers) where label is CLEAN | SUSPICIOUS | DANGEROUS
+    and triggers is a list of exact "<what> (<why>)" strings that caused it
+    (empty for CLEAN).
 
     DANGEROUS  = /etc/shadow accessed
                OR /.ssh/ accessed
@@ -424,22 +430,22 @@ def _verdict(events):
                OR network connections attempted
     CLEAN      = neither
     """
-    has_shadow    = any('/etc/shadow' in e['path'] for e in events['files'])
-    has_ssh       = any('/.ssh/'      in e['path'] for e in events['files'])
-    has_sensitive = any(e['sensitive']              for e in events['files'])
-    has_network   = bool(events['network'])
+    sensitive_files = [e['path'] for e in events['files'] if e['sensitive']]
+    networks        = events['network']
 
-    if has_shadow:
-        return 'DANGEROUS',  '/etc/shadow accessed — credential theft attempt detected'
-    if has_ssh:
-        return 'DANGEROUS',  '/.ssh/ accessed — SSH key exfiltration attempt detected'
-    if has_sensitive and has_network:
-        return 'DANGEROUS',  'Sensitive file access combined with network connections'
-    if has_sensitive:
-        return 'SUSPICIOUS', 'Accessed sensitive system files'
-    if has_network:
-        return 'SUSPICIOUS', 'Made outbound network connection attempts'
-    return 'CLEAN', 'No sensitive file access. No network activity detected.'
+    has_shadow    = any('/etc/shadow' in p for p in sensitive_files)
+    has_ssh       = any('/.ssh/'      in p for p in sensitive_files)
+    has_sensitive = bool(sensitive_files)
+    has_network   = bool(networks)
+
+    triggers  = [f'{p} (sensitive file access)' for p in sensitive_files]
+    triggers += [f'{n["ip"]}:{n["port"]} (network connection)' for n in networks]
+
+    if has_shadow or has_ssh or (has_sensitive and has_network):
+        return 'DANGEROUS', triggers
+    if has_sensitive or has_network:
+        return 'SUSPICIOUS', triggers
+    return 'CLEAN', []
 
 
 # ── Report renderer ───────────────────────────────────────────────────────────
@@ -596,7 +602,7 @@ def _render_report(binary_path, exit_code, elapsed, timed_out, events):
     ))
 
     # ── 6. Verdict ────────────────────────────────────────────────────────────
-    label, reason = _verdict(events)
+    label, triggers = _verdict(events)
 
     if label == 'CLEAN':
         icon, v_style, border = '✔', 'bold green',  'green'
@@ -605,13 +611,22 @@ def _render_report(binary_path, exit_code, elapsed, timed_out, events):
     else:
         icon, v_style, border = '✘', 'bold red',    'red'
 
+    verdict_parts = [
+        ('\n', ''),
+        (f'        {icon}   {label}\n\n', v_style),
+    ]
+    if label == 'CLEAN':
+        verdict_parts.append(
+            ('        No sensitive file access. No network activity detected.\n', 'white')
+        )
+    else:
+        verdict_parts.append(('        Triggered by:\n', 'white'))
+        for trig in triggers:
+            verdict_parts.append((f'          • {trig}\n', 'white'))
+    verdict_parts.append(('\n', ''))
+
     console.print(Panel(
-        Text.assemble(
-            ('\n', ''),
-            (f'        {icon}   {label}\n\n', v_style),
-            (f'        {reason}\n', 'white'),
-            ('\n', ''),
-        ),
+        Text.assemble(*verdict_parts),
         border_style=border,
         box=box.HEAVY,
         padding=(0, 2),
@@ -619,16 +634,22 @@ def _render_report(binary_path, exit_code, elapsed, timed_out, events):
     ))
     console.print()
 
+    return label, triggers
+
 
 # ── Save report ───────────────────────────────────────────────────────────────
 
-def _save_report(binary_path):
+def _save_report(binary_path, exit_code, elapsed, timed_out, events, label, triggers):
     """
     Export everything printed to the console so far as plain text and
-    write it to ~/.lure/reports/<binary>_<timestamp>.txt
+    write it to ~/.lure/reports/<binary>_<timestamp>.txt, plus a
+    companion ~/.lure/reports/<binary>_<timestamp>.json with the
+    structured data from this run.
 
-    Returns the filename (not full path) on success, or None on
-    failure (an error is printed to the console in that case).
+    Returns (txt_filename, json_filename) on success — json_filename
+    is None if only the JSON write failed. Returns None if the
+    reports directory or the .txt file itself couldn't be written
+    (an error is printed to the console in that case).
     """
     try:
         os.makedirs(_REPORTS_DIR, exist_ok=True)
@@ -636,10 +657,13 @@ def _save_report(binary_path):
         console.print(f'[red]Could not create reports directory:[/red] {exc}')
         return None
 
-    name      = Path(binary_path).name
-    timestamp = time.strftime('%Y%m%d_%H%M%S')
-    filename  = f'{name}_{timestamp}.txt'
-    filepath  = os.path.join(_REPORTS_DIR, filename)
+    name          = Path(binary_path).name
+    timestamp_str = time.strftime('%Y%m%d_%H%M%S')
+    base          = f'{name}_{timestamp_str}'
+    txt_filename  = f'{base}.txt'
+    json_filename = f'{base}.json'
+    txt_filepath  = os.path.join(_REPORTS_DIR, txt_filename)
+    json_filepath = os.path.join(_REPORTS_DIR, json_filename)
 
     header = (
         'LURE ANALYSIS REPORT\n'
@@ -654,14 +678,38 @@ def _save_report(binary_path):
     body = console.export_text()
 
     try:
-        with open(filepath, 'w') as f:
+        with open(txt_filepath, 'w') as f:
             f.write(header)
             f.write(body)
     except OSError as exc:
         console.print(f'[red]Could not write report file:[/red] {exc}')
         return None
 
-    return filename
+    report_data = {
+        'binary':            name,
+        'full_path':         binary_path,
+        'timestamp':         datetime.datetime.now().isoformat(),
+        'runtime_seconds':   round(elapsed, 3),
+        'exit_code':         None if timed_out else exit_code,
+        'verdict':           label,
+        'verdict_triggers':  triggers,
+        'files_accessed':    [e['path'] for e in events['files']],
+        'network_attempts':  [
+            {'ip': n['ip'], 'port': n['port'], 'blocked': n['blocked']}
+            for n in events['network']
+        ],
+        'processes_spawned': [p['cmd'] for p in events['processes']],
+        'syscall_total':     sum(events['syscalls'].values()),
+    }
+
+    try:
+        with open(json_filepath, 'w') as f:
+            json.dump(report_data, f, indent=2)
+    except OSError as exc:
+        console.print(f'[red]Could not write JSON report file:[/red] {exc}')
+        return txt_filename, None
+
+    return txt_filename, json_filename
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
@@ -762,17 +810,41 @@ def _execute(binary_path, timeout, binary_args, allow_net, trace_out, tmp_trace,
 
     # ── Full report ────────────────────────────────────────────────────────────
     events = _parse_full_trace(tmp_trace)
-    _render_report(binary_path, exit_code, elapsed, timed_out, events)
+    label, triggers = _render_report(binary_path, exit_code, elapsed, timed_out, events)
 
     # ── Save report ───────────────────────────────────────────────────────────
     if save:
-        filename = _save_report(binary_path)
-        if filename:
+        result = _save_report(
+            binary_path, exit_code, elapsed, timed_out, events, label, triggers
+        )
+        if result:
+            txt_filename, json_filename = result
             console.print(
                 f'  [bold green]✔[/bold green] Report saved to '
-                f'[bold]~/.lure/reports/{filename}[/bold]'
+                f'[bold]~/.lure/reports/{txt_filename}[/bold]'
             )
+            if json_filename:
+                console.print(
+                    f'  [bold green]✔[/bold green] JSON report saved to '
+                    f'[bold]~/.lure/reports/{json_filename}[/bold]'
+                )
             console.print()
+
+
+# ── Package manager detection ─────────────────────────────────────────────────
+
+def _strace_install_hint():
+    """
+    Detect the system's package manager (pacman, then apt, then dnf)
+    and return the matching install command, or None if none found.
+    """
+    if shutil.which('pacman'):
+        return 'sudo pacman -S strace'
+    if shutil.which('apt'):
+        return 'sudo apt install strace'
+    if shutil.which('dnf'):
+        return 'sudo dnf install strace'
+    return None
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
@@ -785,8 +857,19 @@ def run_binary(binary, timeout, binary_args, allow_net, trace_out, save=False):
         console.print(f'[red]Error:[/red] {binary_path} — file not found')
         return
 
+    if not is_elf_file(binary_path):
+        console.print(f'[red]{NOT_ELF_ERROR}[/red]')
+        return
+
     if not shutil.which('strace'):
-        console.print('[red]Error:[/red] strace not found — apt install strace')
+        hint = _strace_install_hint()
+        if hint:
+            console.print(f'[red]Error:[/red] strace not found — install it with: {hint}')
+        else:
+            console.print(
+                '[red]Error:[/red] strace not found, and no supported package '
+                'manager (pacman, apt, dnf) was detected — install strace manually.'
+            )
         return
 
     # Temp file for strace output (deleted on exit unless --out specified)
