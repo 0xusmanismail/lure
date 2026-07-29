@@ -2,13 +2,13 @@
 
 > Local Linux binary analysis. Zero cloud. Zero root. Zero cost.
 
-⚠️ **Early development (v0.2).** Core features (`inspect`, `run`,
+⚠️ **Early development (v0.2.0).** Core features (`inspect`, `run`,
 `diff`) work end to end on x86_64 Linux. This is a young project —
 expect rough edges, limited error handling on unusual inputs, and
 missing features. Bug reports, feedback, and contributions are very
 welcome.
 
-![Lure run demo](assets/run-1.png)
+![Lure dangerous verdict](assets/dangerous-3.png)
 
 ## What it does
 
@@ -37,13 +37,9 @@ pip install -e . --break-system-packages
 
 The `--break-system-packages` flag is required on Arch Linux and on
 recent Debian/Ubuntu releases, which restrict installing into the
-system Python environment by default (PEP 668). You can alternatively
-run `./setup.sh` to install (and reinstall) everything automatically.
+system Python environment by default (PEP 668).
 
-Requires `strace` and `unshare`. On Arch: `sudo pacman -S strace`
-(`unshare` is part of `util-linux`, installed by default). On
-Debian/Ubuntu/Kali: `sudo apt install strace`. On Fedora:
-`sudo dnf install strace`.
+Requires `strace` and `unshare` installed.
 
 ## Usage
 
@@ -53,65 +49,73 @@ Debian/Ubuntu/Kali: `sudo apt install strace`. On Fedora:
 lure inspect /bin/ls
 ```
 
-Reads ELF headers, architecture, security mitigations (NX, PIE,
-RELRO, stack canary), linked libraries, file hashes, and packer
-detection — without executing a single byte of code.
+Reads ELF headers, architecture, security mitigations, linked libraries, and file hashes — without executing a single byte of code.
 
-![Lure inspect part 1](assets/inspect-1.png)
-![Lure inspect part 2](assets/inspect-2.png)
+![inspect](assets/inspect-1.png)
 
 ### Run a binary in the sandbox
 
 ```bash
-lure run /bin/ls
+lure run ./suspicious_binary
 ```
 
-Live feed of file access, network attempts, and spawned processes
-during execution, followed by a full report: execution summary,
-files accessed, network activity, process tree, syscall breakdown,
-and a CLEAN / SUSPICIOUS / DANGEROUS verdict.
+Live feed of file access, network attempts, and spawned processes, followed by a full behavioral report.
 
-![Lure run part 1](assets/run-1.png)
-![Lure run part 2](assets/run-2.png)
-![Lure run part 3](assets/run-3.png)
+![run live feed](assets/run-1.png)
 
-### Save the report
+![run report](assets/run-2.png)
+
+### Catch suspicious behavior
+
+```bash
+lure run ./demo_dangerous
+```
+
+Sensitive file access combined with network activity trips a DANGEROUS verdict, with the exact triggers listed.
+
+![dangerous analysis](assets/dangerous-1.png)
+
+![dangerous report](assets/dangerous-2.png)
+
+![dangerous verdict](assets/dangerous-3.png)
+
+### Compare two runs with lure diff
 
 ```bash
 lure run --save /bin/ls
+lure run --save /bin/echo
+lure diff report1.json report2.json
 ```
 
-Saves the full report to `~/.lure/reports/` as both a plain-text
-`.txt` file and a structured `.json` file.
+Shows new/removed files, new connections, verdict changes, and syscall count differences between two saved runs.
 
-### Compare two reports
+![diff output](assets/diff-1.png)
+
+### Save a report
 
 ```bash
-lure diff ~/.lure/reports/a.json ~/.lure/reports/b.json
+lure run --save ./binary
 ```
 
-Shows new/removed files, new network connections, verdict changes,
-and the syscall count delta between two saved runs.
+Saves the full report to `~/.lure/reports/` as both a plain-text `.txt` file and a structured `.json` file.
 
 ## Status & Roadmap
-
-This is a v0.2 release built and tested on Arch Linux (x86_64).
 
 **Working now:**
 - ELF inspection with security mitigation detection
 - Sandboxed execution via `unshare` + `strace`
 - Live event feed during execution
-- Full behavioral report with verdict, listing exact triggers
-- Report saving (`.txt` + `.json`)
-- Report comparison (`lure diff`)
+- Full behavioral report with CLEAN/SUSPICIOUS/DANGEROUS verdict
+- Verdict shows exact triggering files and IPs
+- Report saving (plain text + JSON)
+- Report comparison via `lure diff`
+- Non-ELF file detection with clean error messages
+- Works on Arch Linux, Kali, Debian, Ubuntu
 
 **Planned:**
-- Better edge-case handling (invalid binaries, missing args, etc.)
-- Refined verdict heuristics
-- Packaged releases (no manual `pip install -e .`)
-
-Issues and pull requests are welcome — this project is actively
-developed.
+- Demo GIF showing live execution
+- PyPI package (`pip install lure-analyze`)
+- Packaged releases
 
 ## License
 

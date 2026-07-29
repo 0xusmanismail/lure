@@ -6,3 +6,5 @@ dist/
 .venv/
 venv/
 .lure/
+demo_dangerous
+demo_dangerous.c
