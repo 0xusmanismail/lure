@@ -39,11 +39,23 @@ hardened sandbox.
 
 ## Install
 
+### From PyPI (recommended)
+
+```bash
+pip install lure-analyze --break-system-packages
+lure --version
+```
+
+### From source
+
 ```bash
 git clone https://github.com/0xusmanismail/lure.git
 cd lure
 pip install -e . --break-system-packages
 ```
+
+Note: the PyPI package is named `lure-analyze` because "lure" was
+already taken. The command is still `lure`.
 
 The `--break-system-packages` flag is required on Arch Linux and on
 recent Debian/Ubuntu releases, which restrict installing into the
@@ -124,7 +136,6 @@ Saves the full report to `~/.lure/reports/` as both a plain-text `.txt` file and
 
 **Planned:**
 - Demo GIF showing live execution
-- PyPI package (`pip install lure-analyze`)
 - Packaged releases
 
 ## License

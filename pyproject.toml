@@ -6,16 +6,47 @@ requires      = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name            = "lure"
+name            = "lure-analyze"
 version         = "0.2.0"
 description     = "Local Linux binary analysis tool for security researchers and CTF players"
+readme          = "README.md"
 requires-python = ">=3.9"
 license         = { text = "MIT" }
+authors         = [
+    { name = "Usman Ismail", email = "0xusmanismail@proton.me" },
+]
+keywords = [
+    "security",
+    "malware",
+    "sandbox",
+    "linux",
+    "binary-analysis",
+    "strace",
+    "elf",
+    "ctf",
+    "reverse-engineering",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: System :: Monitoring",
+]
 dependencies    = [
     "click>=8.1",
     "rich>=13.7",
     "pyelftools>=0.30",
 ]
+
+[project.urls]
+Homepage   = "https://github.com/0xusmanismail/lure"
+Repository = "https://github.com/0xusmanismail/lure"
+Issues     = "https://github.com/0xusmanismail/lure/issues"
 
 [project.scripts]
 lure = "lure.main:cli"
