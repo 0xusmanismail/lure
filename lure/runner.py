@@ -11,6 +11,7 @@ import json
 import time
 import shlex
 import shutil
+import signal
 import tempfile
 import datetime
 import threading
@@ -138,9 +139,9 @@ _ALWAYS_WRITE_SYSCALLS = frozenset({
 
 _MAX_FILE_ROWS = 40
 _MAX_PROC_ROWS = 20
-_MAX_OUTPUT_LINES  = 50
+_MAX_OUTPUT_LINES  = 100
 _OUTPUT_HEAD_LINES = 25
-_OUTPUT_TAIL_LINES = 25
+_OUTPUT_TAIL_LINES = 10
 
 _REPORTS_DIR = os.path.expanduser('~/.lure/reports')
 
@@ -151,7 +152,7 @@ def _read_program_output(path):
     chronological order) from `path`.
 
     Returns a list of display lines, already truncated to at most
-    _MAX_OUTPUT_LINES (first 25 / last 25 + an omitted-count marker
+    _MAX_OUTPUT_LINES (first 25 / last 10 + an omitted-count marker
     if the output is longer), or None if there was no output at all.
     """
     try:
@@ -176,6 +177,22 @@ def _read_program_output(path):
 
 
 # ── Path / access helpers ─────────────────────────────────────────────────────
+
+def _signal_name(exit_code):
+    """
+    subprocess reports a process killed by a signal as a negative
+    returncode (-11 for SIGSEGV, etc). Returns "SIGSEGV (11)" style
+    text, or None if exit_code doesn't represent a signal kill.
+    """
+    if exit_code is None or exit_code >= 0:
+        return None
+    sig_num = -exit_code
+    try:
+        name = signal.Signals(sig_num).name
+    except ValueError:
+        name = f'signal {sig_num}'
+    return f'{name} ({sig_num})'
+
 
 def _is_write_access(syscall, raw):
     """True if this file syscall represents a write/modify operation."""
@@ -556,8 +573,12 @@ def _render_report(binary_path, exit_code, elapsed, timed_out, events, program_o
     total_sc = sum(events['syscalls'].values())
 
     # ── 1. Execution Summary ──────────────────────────────────────────────────
+    sig_info = _signal_name(exit_code)
+
     if timed_out:
         exit_display = Text.assemble(('TIMEOUT', 'bold yellow'), ('  (process killed)', 'dim'))
+    elif sig_info:
+        exit_display = Text.assemble((f'Killed by signal: {sig_info}', 'bold red'))
     elif exit_code == 0:
         exit_display = Text.assemble(('0', 'bold green'), ('  (success)', 'dim'))
     else:
@@ -916,8 +937,14 @@ def _execute(binary_path, timeout, binary_args, allow_net, trace_out, tmp_trace,
 
     # ── Exit line ──────────────────────────────────────────────────────────────
     console.print()
+    sig_info = _signal_name(exit_code)
     if timed_out:
         console.print(f'  [yellow]⚠  Killed after {timeout}s timeout[/yellow]')
+    elif sig_info:
+        console.print(
+            f'  [bold red]✘  Killed by signal: {sig_info}[/bold red]  '
+            f'[dim]in {elapsed:.3f}s[/dim]'
+        )
     else:
         code_str = (
             f'[green]{exit_code}[/green]'
@@ -979,6 +1006,18 @@ def _strace_install_hint():
 def run_binary(binary, timeout, binary_args, allow_net, trace_out, save=False):
     """Called by 'lure run'. Validates inputs then orchestrates execution."""
 
+    # Bare names (no '/' anywhere) are ambiguous: did the user mean "look
+    # this up on PATH" or "the file sitting right here"? We don't guess —
+    # if it's not on PATH but a file by that exact name exists in the
+    # current directory, tell them to be explicit with './' instead of
+    # silently picking one.
+    if os.sep not in binary and not shutil.which(binary):
+        cwd_candidate = os.path.join(os.getcwd(), binary)
+        if os.path.exists(cwd_candidate):
+            console.print(f'[red]Error:[/red] file not found: {binary}')
+            console.print(f"[dim]Tip:[/dim] did you mean './{binary}'?")
+            return
+
     binary_path = os.path.realpath(binary)
     if not Path(binary_path).exists():
         console.print(f'[red]Error:[/red] {binary_path} — file not found')
@@ -1029,7 +1068,5 @@ def run_binary(binary, timeout, binary_args, allow_net, trace_out, save=False):
             pass
         try:
             os.unlink(tmp_output)
-        except OSError:
-            pass
         except OSError:
             pass

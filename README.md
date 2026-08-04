@@ -125,6 +125,7 @@ Saves the full report to `~/.lure/reports/` as both a plain-text `.txt` file and
 
 **Working now:**
 - ELF inspection with security mitigation detection
+- UPX packer detection in inspect
 - Sandboxed execution via `unshare` + `strace`
 - Live event feed during execution
 - Full behavioral report with CLEAN/SUSPICIOUS/DANGEROUS verdict
@@ -136,6 +137,7 @@ Saves the full report to `~/.lure/reports/` as both a plain-text `.txt` file and
 
 **Planned:**
 - Demo GIF showing live execution
+- PyPI package (`pip install lure-analyze`)
 - Packaged releases
 
 ## License

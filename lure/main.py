@@ -23,24 +23,28 @@ def print_banner():
 CONTEXT_SETTINGS = dict(help_option_names=['--help', '-h'])
 
 
-@click.group(context_settings=CONTEXT_SETTINGS)
-@click.version_option(version='0.2.0', prog_name='lure')
+class OrderedGroup(click.Group):
+    """Lists subcommands in the order they were defined, not alphabetically."""
+    def list_commands(self, ctx):
+        return list(self.commands)
+
+
+@click.group(cls=OrderedGroup, context_settings=CONTEXT_SETTINGS)
+@click.version_option(
+    version='0.3.0', prog_name='lure', help='Show version and exit.'
+)
 def cli():
     """
     \b
-    Lure — local Linux binary analysis tool.
-
-    \b
-    Runs untrusted ELF binaries and shows exactly what they did.
-    Files accessed. Network attempts. Processes spawned.
-    Zero cloud upload. Zero root. Zero cost.
+    Lure — local Linux binary analysis.
+    Zero cloud. Zero root. Zero cost.
     """
 
 
 # ── inspect ────────────────────────────────────────────────────────────────────
 
-@cli.command()
-@click.argument('binary', type=click.Path(exists=True, readable=True))
+@cli.command(short_help='Analyse an ELF binary without running it.')
+@click.argument('binary', type=click.Path())
 @click.option('--json', 'output_json', is_flag=True, default=False,
               help='Emit results as JSON instead of a rich table.')
 @click.option('--sections', 'show_sections', is_flag=True, default=False,
@@ -48,22 +52,18 @@ def cli():
 @click.option('--strings', 'show_strings', is_flag=True, default=False,
               help='Print interesting printable strings found in the binary.')
 def inspect(binary, output_json, show_sections, show_strings):
-    """Parse and inspect an ELF binary without executing it.
+    """Analyse an ELF binary without running it.
 
     \b
     BINARY  Path to the ELF binary to inspect.
 
     \b
-    Reads ELF headers, architecture, security mitigations, imported
-    libraries, and suspicious strings — without executing a single
-    byte of code.
+    Reads ELF headers, architecture, security mitigations, linked
+    libraries, and file hashes — without executing a single byte
+    of code.
 
     \b
-    Examples:
-    \b
-      lure inspect /bin/ls
-      lure inspect ./crackme --sections --strings
-      lure inspect ./crackme --json
+    Example: lure inspect /bin/ls
     """
     from lure.inspector import run_inspect
     if not output_json:
@@ -73,8 +73,8 @@ def inspect(binary, output_json, show_sections, show_strings):
 
 # ── run ────────────────────────────────────────────────────────────────────────
 
-@cli.command()
-@click.argument('binary', type=click.Path(exists=True, readable=True))
+@cli.command(short_help='Execute a binary in an isolated sandbox.')
+@click.argument('binary', type=click.Path())
 @click.option('--timeout', '-t', default=30, show_default=True, metavar='SECS',
               help='Maximum wall-clock seconds to let the binary run.')
 @click.option('--args', 'binary_args', default='', metavar="'ARG ...'",
@@ -87,7 +87,7 @@ def inspect(binary, output_json, show_sections, show_strings):
 @click.option('--save', 'save_report', is_flag=True, default=False,
               help='Save the full rendered report to ~/.lure/reports/<binary>_<timestamp>.txt')
 def run(binary, timeout, binary_args, allow_net, trace_out, save_report):
-    """Execute a binary in an isolated sandbox and capture its behaviour.
+    """Execute a binary in an isolated sandbox.
 
     \b
     BINARY  Path to the ELF binary to execute.
@@ -95,17 +95,10 @@ def run(binary, timeout, binary_args, allow_net, trace_out, save_report):
     \b
     Uses strace + Linux namespaces (unshare) for lightweight isolation.
     Captures every syscall, streams a live event feed, then renders a
-    full six-section report. Network is blocked by default. No root required.
+    full behavioral report. Network is blocked by default. No root required.
 
     \b
-    Examples:
-    \b
-      lure run /bin/ls
-      lure run /bin/ls --save
-      lure run ./suspicious --timeout 10
-      lure run ./suspicious --args '-v --port 9999'
-      lure run ./suspicious --out run.trace
-      lure run ./suspicious --allow-net --out run.trace
+    Example: lure run --save ./suspicious_binary
     """
     from lure.runner import run_binary
     print_banner()
@@ -114,20 +107,18 @@ def run(binary, timeout, binary_args, allow_net, trace_out, save_report):
 
 # ── diff ───────────────────────────────────────────────────────────────────────
 
-@cli.command()
-@click.argument('report1', type=click.Path(exists=True, readable=True))
-@click.argument('report2', type=click.Path(exists=True, readable=True))
+@cli.command(short_help='Compare two saved execution reports.')
+@click.argument('report1', type=click.Path())
+@click.argument('report2', type=click.Path())
 def diff(report1, report2):
-    """Compare two saved JSON reports and show what changed between runs.
+    """Compare two saved execution reports.
 
     \b
     REPORT1  Path to the earlier .json report (produced by 'lure run --save').
     REPORT2  Path to the later .json report.
 
     \b
-    Examples:
-    \b
-      lure diff ~/.lure/reports/a.json ~/.lure/reports/b.json
+    Example: lure diff report1.json report2.json
     """
     from lure.diff import run_diff
     print_banner()

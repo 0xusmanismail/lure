@@ -412,6 +412,10 @@ def run_inspect(
         console.print(f'[red]Error:[/red] file not found: {filepath}')
         return
 
+    if path.stat().st_size == 0:
+        console.print('[red]Error: file is empty.[/red]')
+        return
+
     if not is_elf_file(filepath):
         console.print(f'[red]{NOT_ELF_ERROR}[/red]')
         return
