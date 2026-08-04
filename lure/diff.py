@@ -56,12 +56,14 @@ def run_diff(report1_path, report2_path):
 
     r1, err1 = _load_report(report1_path)
     if err1:
-        console.print(f'[red]Error:[/red] {report1_path} — {err1}')
+        console.print(f'[red]Error: cannot read report: {report1_path}[/red]')
+        console.print('[dim]Make sure the file exists and was saved with lure run --save[/dim]')
         return
 
     r2, err2 = _load_report(report2_path)
     if err2:
-        console.print(f'[red]Error:[/red] {report2_path} — {err2}')
+        console.print(f'[red]Error: cannot read report: {report2_path}[/red]')
+        console.print('[dim]Make sure the file exists and was saved with lure run --save[/dim]')
         return
 
     console.print(Panel.fit(
@@ -82,9 +84,12 @@ def run_diff(report1_path, report2_path):
     console.print(_list_panel('Removed Files', removed_files, 'red'))
 
     # ── Network ────────────────────────────────────────────────────────────────
-    net1 = {(n['ip'], n['port']) for n in r1.get('network_attempts', [])}
-    net2 = {(n['ip'], n['port']) for n in r2.get('network_attempts', [])}
-    new_conns = sorted(f'{ip}:{port}' for ip, port in (net2 - net1))
+    net1 = {(n['ip'], n['port'], n.get('family', 'IPv4')) for n in r1.get('network_attempts', [])}
+    net2 = {(n['ip'], n['port'], n.get('family', 'IPv4')) for n in r2.get('network_attempts', [])}
+    new_conns = sorted(
+        f'[{ip}]:{port}' if family == 'IPv6' else f'{ip}:{port}'
+        for ip, port, family in (net2 - net1)
+    )
 
     console.print(_list_panel('New Connections', new_conns, 'cyan'))
 

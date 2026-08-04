@@ -6,6 +6,6 @@ dist/
 .venv/
 venv/
 .lure/
-demo_dangerous
-demo_dangerous.c
-setup.sh
+demo.cast
+demo.gif
+record_demo.sh

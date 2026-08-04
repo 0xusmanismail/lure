@@ -296,6 +296,14 @@ def _parse_line(raw):
     return {'syscall': syscall, 'retval': retval, 'raw': line}
 
 
+def _format_addr(ip, port, family):
+    """IPv6 addresses get bracketed (RFC 3986 style) to disambiguate
+    the address's own colons from the ip:port separator."""
+    if family == 'IPv6':
+        return f'[{ip}]:{port}'
+    return f'{ip}:{port}'
+
+
 def _classify(parsed):
     """
     Turn a parsed strace dict into a typed event, or None.
@@ -338,10 +346,17 @@ def _classify(parsed):
 
     # ── Network events ────────────────────────────────────────────────────────
     elif sc == 'connect':
-        if 'AF_INET' not in raw:
+        if 'AF_INET6' in raw:
+            ip_m   = re.search(r'inet_pton\(AF_INET6,\s*"([^"]+)"', raw)
+            port_m = re.search(r'sin6_port=htons\((\d+)\)', raw)
+            family = 'IPv6'
+        elif 'AF_INET' in raw:
+            ip_m   = re.search(r'inet_addr\("([^"]+)"\)', raw)
+            port_m = re.search(r'sin_port=htons\((\d+)\)', raw)
+            family = 'IPv4'
+        else:
             return None
-        ip_m   = re.search(r'inet_addr\("([^"]+)"\)', raw)
-        port_m = re.search(r'sin_port=htons\((\d+)\)', raw)
+
         if not (ip_m and port_m):
             return None
         blocked = rv not in (None, '0')
@@ -349,6 +364,7 @@ def _classify(parsed):
             'type':    'network',
             'ip':      ip_m.group(1),
             'port':    int(port_m.group(1)),
+            'family':  family,
             'blocked': blocked,
             'retval':  rv,
         }
@@ -419,14 +435,15 @@ def _live_tail(trace_path, start_time, stop_evt):
                     )
 
                 elif evt['type'] == 'network':
-                    key = (evt['ip'], evt['port'])
+                    key = (evt['ip'], evt['port'], evt['family'])
                     if key in seen_network:
                         continue
                     seen_network.add(key)
                     blk = ' [red](BLOCKED)[/red]' if evt['blocked'] else ''
+                    addr = _format_addr(evt['ip'], evt['port'], evt['family'])
                     console.print(
                         f'  🌐 [{ts}] [cyan]CONNECT[/cyan] '
-                        f'[cyan]{evt["ip"]}:{evt["port"]}[/cyan]{blk}'
+                        f'[cyan]{addr}[/cyan]{blk}'
                     )
 
     except (FileNotFoundError, OSError):
@@ -496,12 +513,13 @@ def _parse_full_trace(trace_path):
                         processes.append({'cmd': cmd})
 
                 elif evt['type'] == 'network':
-                    key = (evt['ip'], evt['port'])
+                    key = (evt['ip'], evt['port'], evt['family'])
                     if key not in seen_network:
                         seen_network.add(key)
                         network.append({
                             'ip':      evt['ip'],
                             'port':    evt['port'],
+                            'family':  evt['family'],
                             'blocked': evt['blocked'],
                         })
 
@@ -556,7 +574,10 @@ def _verdict(events):
     has_sensitive_write = any(e['write'] for e in sensitive_entries)
 
     triggers  = [f'{p} (sensitive file access)' for p in sensitive_paths]
-    triggers += [f'{n["ip"]}:{n["port"]} (network connection)' for n in networks]
+    triggers += [
+        f'{_format_addr(n["ip"], n["port"], n["family"])} (network connection)'
+        for n in networks
+    ]
 
     if has_shadow or has_ssh or (has_sensitive_write and has_network):
         return 'DANGEROUS', triggers
@@ -672,6 +693,7 @@ def _render_report(binary_path, exit_code, elapsed, timed_out, events, program_o
         )
         nt.add_column('Destination', style='cyan',  no_wrap=True)
         nt.add_column('Port',        no_wrap=True,  min_width=6,  justify='right')
+        nt.add_column('Family',      no_wrap=True,  min_width=6)
         nt.add_column('Status',      no_wrap=True,  min_width=12)
         for conn in network:
             status = (
@@ -679,7 +701,7 @@ def _render_report(binary_path, exit_code, elapsed, timed_out, events, program_o
                 if conn['blocked']
                 else Text('CONNECTED', style='bold green')
             )
-            nt.add_row(conn['ip'], str(conn['port']), status)
+            nt.add_row(conn['ip'], str(conn['port']), conn['family'], status)
         net_body = nt
 
     console.print(Panel(
@@ -836,7 +858,7 @@ def _save_report(binary_path, exit_code, elapsed, timed_out, events, label, trig
         'verdict_triggers':  triggers,
         'files_accessed':    [e['path'] for e in events['files']],
         'network_attempts':  [
-            {'ip': n['ip'], 'port': n['port'], 'blocked': n['blocked']}
+            {'ip': n['ip'], 'port': n['port'], 'family': n['family'], 'blocked': n['blocked']}
             for n in events['network']
         ],
         'processes_spawned': [p['cmd'] for p in events['processes']],

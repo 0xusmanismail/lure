@@ -2,7 +2,7 @@
 
 > Local Linux binary analysis. Zero cloud. Zero root. Zero cost.
 
-⚠️ **Early development (v0.2.0).** Core features (`inspect`, `run`,
+⚠️ **Early development (v0.3.0).** Core features (`inspect`, `run`,
 `diff`) work end to end on x86_64 Linux. This is a young project —
 expect rough edges, limited error handling on unusual inputs, and
 missing features. Bug reports, feedback, and contributions are very
@@ -134,10 +134,10 @@ Saves the full report to `~/.lure/reports/` as both a plain-text `.txt` file and
 - Report comparison via `lure diff`
 - Non-ELF file detection with clean error messages
 - Works on Arch Linux, Kali, Debian, Ubuntu
+- Available on PyPI as lure-analyze
 
 **Planned:**
 - Demo GIF showing live execution
-- PyPI package (`pip install lure-analyze`)
 - Packaged releases
 
 ## License

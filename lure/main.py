@@ -85,7 +85,7 @@ def inspect(binary, output_json, show_sections, show_strings):
               type=click.Path(dir_okay=False),
               help='Save the raw strace log to FILE for later inspection.')
 @click.option('--save', 'save_report', is_flag=True, default=False,
-              help='Save the full rendered report to ~/.lure/reports/<binary>_<timestamp>.txt')
+              help='Save the full report to ~/.lure/reports/ as both .txt and .json')
 def run(binary, timeout, binary_args, allow_net, trace_out, save_report):
     """Execute a binary in an isolated sandbox.
 
