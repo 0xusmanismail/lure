@@ -7,5 +7,7 @@ dist/
 venv/
 .lure/
 demo.cast
-demo.gif
 record_demo.sh
+run_demo.py
+make_demo.sh
+setup.sh

@@ -2,6 +2,8 @@
 
 > Local Linux binary analysis. Zero cloud. Zero root. Zero cost.
 
+![Lure demo](assets/demo.gif)
+
 ⚠️ **Early development (v0.3.0).** Core features (`inspect`, `run`,
 `diff`) work end to end on x86_64 Linux. This is a young project —
 expect rough edges, limited error handling on unusual inputs, and
@@ -63,6 +65,12 @@ system Python environment by default (PEP 668).
 
 Requires `strace` and `unshare` installed.
 
+## Tested on
+
+- Arch Linux (primary development platform)
+- Kali Linux
+- Debian / Ubuntu
+
 ## Usage
 
 ### Inspect a binary
@@ -95,11 +103,7 @@ lure run ./demo_dangerous
 
 Sensitive file access combined with network activity trips a DANGEROUS verdict, with the exact triggers listed.
 
-![dangerous analysis](assets/dangerous-1.png)
-
-![dangerous report](assets/dangerous-2.png)
-
-![dangerous verdict](assets/dangerous-3.png)
+![Lure catching dangerous behavior](assets/dangerous-3.png)
 
 ### Compare two runs with lure diff
 
@@ -135,10 +139,14 @@ Saves the full report to `~/.lure/reports/` as both a plain-text `.txt` file and
 - Non-ELF file detection with clean error messages
 - Works on Arch Linux, Kali, Debian, Ubuntu
 - Available on PyPI as lure-analyze
+- Demo GIF in README
 
 **Planned:**
-- Demo GIF showing live execution
-- Packaged releases
+- Automated test suite
+- Mount namespace (stronger filesystem isolation)
+- seccomp syscall filtering
+- ARM64 binary support
+- Windows PE analysis (via Wine)
 
 ## License
 
