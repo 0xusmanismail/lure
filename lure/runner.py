@@ -1,8 +1,17 @@
 # FILE: lure/runner.py
 """
-Sandbox execution engine for 'lure run'.
-Combines strace (syscall capture) with unshare
-(user + network namespace isolation, no root required).
+Lure runner — sandboxed ELF execution engine.
+
+Isolation model (full):
+  - User namespace (--map-root-user)
+  - Network namespace (blocks outbound by default)
+  - Mount namespace + minimal read-only chroot
+  - PID namespace
+
+Fallback (if mount namespace unavailable):
+  - User namespace + network namespace only
+
+Uses strace for behavioral observation.
 """
 
 import os
@@ -38,11 +47,12 @@ console = Console(record=True)
 # ── Mount-namespace sandbox root ─────────────────────────────────────────────
 #
 # 'lure run' builds a minimal chroot for the guest binary: read-only
-# bind mounts of /usr, /lib, /lib64, /bin, an isolated /proc, and just
-# enough of /etc for the dynamic linker to work. This script is what
-# actually runs INSIDE the new mount+pid namespace (spawned by
-# `unshare --mount --pid --fork ...`) — it sets the root up, then
-# execs into strace -> the guest binary.
+# bind mounts of /usr, /lib, /lib64, /bin, /sbin (if present), an
+# isolated /proc, a size-capped tmpfs /tmp, a handful of standard
+# /dev nodes, and just enough of /etc for the dynamic linker to work.
+# This script is what actually runs INSIDE the new mount+pid namespace
+# (spawned by `unshare --mount --pid --fork ...`) — it sets the root
+# up, then execs into strace -> the guest binary.
 #
 # It writes a single byte to a pre-opened marker file immediately
 # before that final exec. That's the only reliable way to tell
@@ -54,12 +64,22 @@ SETUP_FAILURE_EXIT = 97
 _ROOT_INIT_SRC = '''\
 import os
 import shutil
+import stat
 import subprocess
 import sys
 
-BIND_DIRS     = ('usr', 'lib', 'lib64', 'bin')
-ETC_FILES     = ('ld.so.cache', 'ld.so.conf', 'nsswitch.conf')
-SKELETON_DIRS = ('bin', 'lib', 'lib64', 'usr', 'tmp', 'proc', 'dev', 'etc')
+BIND_DIRS_BASE = ('usr', 'lib', 'lib64', 'bin')
+ETC_FILES      = ('ld.so.cache', 'ld.so.conf', 'nsswitch.conf')
+SKELETON_DIRS  = ('bin', 'lib', 'lib64', 'usr', 'sbin', 'tmp', 'proc', 'dev', 'etc')
+
+# (name, mode, major, minor) -- standard character-device numbers,
+# the same across all Linux distributions.
+DEV_NODES = (
+    ('null',    0o666, 1, 3),
+    ('zero',    0o666, 1, 5),
+    ('urandom', 0o666, 1, 9),
+    ('tty',     0o666, 5, 0),
+)
 
 
 def fail(msg):
@@ -85,7 +105,33 @@ def main():
         os.set_inheritable(trace_fd, True)
         marker_fd = os.open(marker_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
 
-        for d in BIND_DIRS:
+        # Essential device nodes. Best-effort: some environments deny
+        # mknod even inside a fresh user+mount namespace -- silently
+        # skip and the guest just won't have that node.
+        for name, mode, major, minor in DEV_NODES:
+            try:
+                os.mknod(
+                    os.path.join(root_dir, 'dev', name),
+                    mode | stat.S_IFCHR,
+                    os.makedev(major, minor),
+                )
+            except OSError:
+                pass
+
+        # tmpfs on /tmp so a guest can't fill the host disk under the
+        # temp root. Non-fatal: /tmp stays a plain (unbounded) directory
+        # if this mount fails for any reason.
+        subprocess.run(
+            ['mount', '-t', 'tmpfs', '-o', 'size=64m,mode=1777', 'tmpfs',
+             os.path.join(root_dir, 'tmp')],
+            check=False,
+        )
+
+        bind_dirs = list(BIND_DIRS_BASE)
+        if os.path.isdir('/sbin'):
+            bind_dirs.append('sbin')
+
+        for d in bind_dirs:
             host_path  = '/' + d
             guest_path = os.path.join(root_dir, d)
             if not os.path.isdir(host_path):
@@ -929,7 +975,7 @@ def _render_report(binary_path, exit_code, elapsed, timed_out, events, program_o
 
 # ── Save report ───────────────────────────────────────────────────────────────
 
-def _save_report(binary_path, exit_code, elapsed, timed_out, events, label, triggers):
+def _save_report(binary_path, exit_code, elapsed, timed_out, events, label, triggers, isolation):
     """
     Export everything printed to the console so far as plain text and
     write it to ~/.lure/reports/<binary>_<timestamp>.txt, plus a
@@ -981,6 +1027,7 @@ def _save_report(binary_path, exit_code, elapsed, timed_out, events, label, trig
         'timestamp':         datetime.datetime.now().isoformat(),
         'runtime_seconds':   round(elapsed, 3),
         'exit_code':         None if timed_out else exit_code,
+        'isolation':         isolation,
         'verdict':           label,
         'verdict_triggers':  triggers,
         'files_accessed':    [e['path'] for e in events['files']],
@@ -1060,7 +1107,16 @@ def _execute(binary_path, timeout, binary_args, allow_net, trace_out, tmp_trace,
 
     # "Full" isolation: mount + pid namespace with a minimal chroot,
     # plus network namespace unless the caller passed --allow-net.
-    root_dir       = os.path.join(tempfile.gettempdir(), f'lure-root-{uuid.uuid4().hex[:12]}')
+    root_dir = os.path.join(tempfile.gettempdir(), f'lure-root-{uuid.uuid4().hex[:12]}')
+    try:
+        # 0o700: other users on a shared /tmp must not be able to even
+        # list, let alone read, the guest's temporary filesystem while
+        # a run is in progress.
+        os.makedirs(root_dir, mode=0o700, exist_ok=False)
+    except OSError as exc:
+        console.print(f'[red]Error:[/red] could not create sandbox root: {exc}')
+        return
+
     fd, marker_path = tempfile.mkstemp(prefix='lure_marker_', suffix='.flag')
     os.close(fd)
     init_script_path = _write_root_init_script()
@@ -1214,7 +1270,7 @@ def _execute(binary_path, timeout, binary_args, allow_net, trace_out, tmp_trace,
     # ── Save report ───────────────────────────────────────────────────────────
     if save:
         result = _save_report(
-            binary_path, exit_code, elapsed, timed_out, events, label, triggers
+            binary_path, exit_code, elapsed, timed_out, events, label, triggers, iso_label
         )
         if result:
             txt_filename, json_filename = result
