@@ -4,22 +4,23 @@
 
 ![Lure demo](assets/demo.gif)
 
-⚠️ **Early development (v0.3.1).** Core features (`inspect`, `run`,
+⚠️ **Early development (v0.4.0).** Core features (`inspect`, `run`,
 `diff`) work end to end on x86_64 Linux. This is a young project —
 expect rough edges, limited error handling on unusual inputs, and
 missing features. Bug reports, feedback, and contributions are very
-welcome. Network isolation is enforced. Filesystem isolation is
-not — run inside a VM when analyzing untrusted samples.
+welcome. Network and filesystem isolation are enforced by default;
+if mount namespace setup fails on your system, Lure falls back to
+network-only isolation and says so clearly in the report.
 
 ![Lure dangerous verdict](assets/dangerous-3.png)
 
 ## What it does
 
-Lure runs an untrusted Linux binary in a lightweight monitoring
-environment (user + network namespaces + strace) and tells you
-exactly what it did — which files it touched, what network
-connections it tried, what processes it spawned — then gives you a
-plain verdict: **CLEAN**, **SUSPICIOUS**, or **DANGEROUS**.
+Lure runs an untrusted Linux binary in an isolated environment (user,
+network, mount, and PID namespaces + strace) and tells you exactly
+what it did — which files it touched, what network connections it
+tried, what processes it spawned — then gives you a plain verdict:
+**CLEAN**, **SUSPICIOUS**, or **DANGEROUS**.
 
 Everything happens on your machine. Nothing is uploaded anywhere.
 
@@ -32,12 +33,12 @@ Everything happens on your machine. Nothing is uploaded anywhere.
 
 ## Isolation model
 
-Lure uses Linux user and network namespaces to prevent the binary
-from making outbound network connections. The host filesystem
-remains visible to the analyzed binary. For stronger isolation
-(mount namespace, seccomp, cgroups), run Lure inside a VM or
-container. Lure is primarily a behavioral observation tool, not a
-hardened sandbox.
+Lure uses Linux user, network, mount, and PID namespaces. The binary
+runs in an isolated filesystem root with read-only access to system
+libraries. It cannot modify the host filesystem. Network connections
+are blocked by default. Lure is primarily a behavioral observation
+tool, not a hardened sandbox — for stronger isolation (seccomp,
+cgroups), run Lure inside a VM or container.
 
 ## Install
 
@@ -131,6 +132,7 @@ Saves the full report to `~/.lure/reports/` as both a plain-text `.txt` file and
 - ELF inspection with security mitigation detection
 - UPX packer detection in inspect
 - Sandboxed execution via `unshare` + `strace`
+- Mount + PID namespace isolation with a minimal read-only chroot
 - Live event feed during execution
 - Full behavioral report with CLEAN/SUSPICIOUS/DANGEROUS verdict
 - Verdict shows exact triggering files and IPs
@@ -143,7 +145,6 @@ Saves the full report to `~/.lure/reports/` as both a plain-text `.txt` file and
 
 **Planned:**
 - Automated test suite
-- Mount namespace (stronger filesystem isolation)
 - seccomp syscall filtering
 - ARM64 binary support
 - Windows PE analysis (via Wine)

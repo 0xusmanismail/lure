@@ -7,6 +7,7 @@ Combines strace (syscall capture) with unshare
 
 import os
 import re
+import sys
 import json
 import time
 import shlex
@@ -16,6 +17,7 @@ import tempfile
 import datetime
 import threading
 import subprocess
+import uuid
 from pathlib import Path
 
 from rich.console import Console
@@ -31,6 +33,130 @@ from lure.inspector import is_elf_file, NOT_ELF_ERROR
 # file for 'lure run --save', while still printing to the terminal
 # exactly as before.
 console = Console(record=True)
+
+
+# ── Mount-namespace sandbox root ─────────────────────────────────────────────
+#
+# 'lure run' builds a minimal chroot for the guest binary: read-only
+# bind mounts of /usr, /lib, /lib64, /bin, an isolated /proc, and just
+# enough of /etc for the dynamic linker to work. This script is what
+# actually runs INSIDE the new mount+pid namespace (spawned by
+# `unshare --mount --pid --fork ...`) — it sets the root up, then
+# execs into strace -> the guest binary.
+#
+# It writes a single byte to a pre-opened marker file immediately
+# before that final exec. That's the only reliable way to tell
+# "sandbox setup failed" apart from "the guest binary ran and exited"
+# — once we're past this point, the guest's own exit code looks
+# identical to a setup failure from the parent's point of view.
+SETUP_FAILURE_EXIT = 97
+
+_ROOT_INIT_SRC = '''\
+import os
+import shutil
+import subprocess
+import sys
+
+BIND_DIRS     = ('usr', 'lib', 'lib64', 'bin')
+ETC_FILES     = ('ld.so.cache', 'ld.so.conf', 'nsswitch.conf')
+SKELETON_DIRS = ('bin', 'lib', 'lib64', 'usr', 'tmp', 'proc', 'dev', 'etc')
+
+
+def fail(msg):
+    sys.stderr.write(f'lure_root_init: {msg}\\n')
+    sys.exit(''' + str(SETUP_FAILURE_EXIT) + ''')
+
+
+def main():
+    if len(sys.argv) < 6 or sys.argv[5] != '--':
+        fail('internal error: bad argv from lure')
+
+    root_dir, trace_path, marker_path, binary_path = sys.argv[1:5]
+    extra_argv = sys.argv[6:]
+
+    try:
+        for d in SKELETON_DIRS:
+            os.makedirs(os.path.join(root_dir, d), exist_ok=True)
+
+        # Pre-open both files BEFORE chroot, while host paths still
+        # resolve normally. trace_fd must survive the exec into
+        # strace below, so it is explicitly marked inheritable.
+        trace_fd = os.open(trace_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        os.set_inheritable(trace_fd, True)
+        marker_fd = os.open(marker_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+
+        for d in BIND_DIRS:
+            host_path  = '/' + d
+            guest_path = os.path.join(root_dir, d)
+            if not os.path.isdir(host_path):
+                continue
+            subprocess.run(['mount', '--bind', host_path, guest_path], check=True)
+            subprocess.run(['mount', '-o', 'remount,ro,bind', guest_path], check=True)
+
+        subprocess.run(
+            ['mount', '-t', 'proc', 'proc', os.path.join(root_dir, 'proc')],
+            check=True,
+        )
+
+        etc_dir = os.path.join(root_dir, 'etc')
+        for fname in ETC_FILES:
+            src = '/etc/' + fname
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(etc_dir, fname))
+
+        guest_name         = os.path.basename(binary_path)
+        guest_path_in_root = os.path.join(root_dir, guest_name)
+        shutil.copy2(binary_path, guest_path_in_root)
+        os.chmod(guest_path_in_root, 0o755)
+
+        os.chdir(root_dir)
+        os.chroot(root_dir)
+        os.chdir('/')
+
+    except Exception as exc:
+        fail(f'setup failed: {exc}')
+
+    # Setup is fully complete. Mark success now, before touching the
+    # guest binary at all.
+    os.write(marker_fd, b'1')
+    os.close(marker_fd)
+
+    strace_cmd = [
+        'strace',
+        '-f', '-tt', '-T',
+        '-e', 'trace=all',
+        '-o', f'/proc/self/fd/{trace_fd}',
+        '--',
+        f'/{guest_name}',
+    ] + extra_argv
+
+    try:
+        os.execvp('strace', strace_cmd)
+    except OSError as exc:
+        sys.stderr.write(f'lure_root_init: exec strace failed: {exc}\\n')
+        sys.exit(98)
+
+
+if __name__ == '__main__':
+    main()
+'''
+
+
+def _write_root_init_script():
+    """Write the embedded init script to a temp file and return its path."""
+    fd, path = tempfile.mkstemp(prefix='lure_root_init_', suffix='.py')
+    with os.fdopen(fd, 'w') as f:
+        f.write(_ROOT_INIT_SRC)
+    return path
+
+
+def _marker_succeeded(marker_path):
+    """True if the init script reached the marker-write step (setup OK)."""
+    try:
+        with open(marker_path, 'rb') as f:
+            return f.read(1) == b'1'
+    except OSError:
+        return False
 
 
 # ── Sensitivity classification ─────────────────────────────────────────────────
@@ -588,7 +714,7 @@ def _verdict(events):
 
 # ── Report renderer ───────────────────────────────────────────────────────────
 
-def _render_report(binary_path, exit_code, elapsed, timed_out, events, program_output):
+def _render_report(binary_path, exit_code, elapsed, timed_out, events, program_output, isolation):
     """Print all report sections after the binary exits."""
 
     total_sc = sum(events['syscalls'].values())
@@ -608,11 +734,12 @@ def _render_report(binary_path, exit_code, elapsed, timed_out, events, program_o
     t = Table(box=None, show_header=False, show_edge=False, padding=(0, 1))
     t.add_column(style='dim', no_wrap=True, min_width=12)
     t.add_column()
-    t.add_row('Binary',    Path(binary_path).name)
-    t.add_row('Full Path', binary_path)
-    t.add_row('Exit Code', exit_display)
-    t.add_row('Runtime',   f'{elapsed:.3f}s')
-    t.add_row('Syscalls',  Text.assemble(
+    t.add_row('Binary',     Path(binary_path).name)
+    t.add_row('Full Path',  binary_path)
+    t.add_row('Exit Code',  exit_display)
+    t.add_row('Runtime',    f'{elapsed:.3f}s')
+    t.add_row('Isolation',  isolation)
+    t.add_row('Syscalls',   Text.assemble(
         (f'{total_sc:,}', 'bold white'), (' captured', 'dim')
     ))
     console.print(Panel(
@@ -877,30 +1004,96 @@ def _save_report(binary_path, exit_code, elapsed, timed_out, events, label, trig
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
+def _launch_and_wait(cmd, timeout, tmp_output, tmp_trace, start_time):
+    """
+    Launch `cmd` with stdout+stderr captured to tmp_output, stream the
+    live feed from tmp_trace while it runs, and wait up to `timeout`
+    seconds. Returns (proc_or_None, exit_code, elapsed, timed_out).
+    proc is None if the launch itself failed (e.g. FileNotFoundError);
+    in that case exit_code is also None.
+    """
+    # stdout/stderr are captured to a real file (not subprocess.PIPE) so a
+    # chatty binary can never deadlock us by filling an unread pipe buffer.
+    # stderr is redirected to the same fd as stdout so the two streams stay
+    # in true chronological order, exactly like a shell's `2>&1`.
+    try:
+        with open(tmp_output, 'wb') as out_f:
+            proc = subprocess.Popen(cmd, stdout=out_f, stderr=subprocess.STDOUT)
+    except FileNotFoundError as exc:
+        console.print(f'[red]Launch failed:[/red] {exc}')
+        return None, None, 0.0, False
+
+    stop_evt    = threading.Event()
+    feed_thread = threading.Thread(
+        target=_live_tail,
+        args=(tmp_trace, start_time, stop_evt),
+        daemon=True,
+    )
+    feed_thread.start()
+
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        timed_out = True
+
+    elapsed = time.time() - start_time
+
+    time.sleep(0.25)
+    stop_evt.set()
+    feed_thread.join(timeout=3)
+
+    return proc, proc.returncode, elapsed, timed_out
+
+
 def _execute(binary_path, timeout, binary_args, allow_net, trace_out, tmp_trace, tmp_output, save):
-    """Build command, run it, stream live feed, render report, optionally save."""
+    """Build command(s), run with mount-namespace isolation (falling back
+    to user+net only if that's unavailable), stream live feed, render
+    report, optionally save."""
 
     binary_argv = shlex.split(binary_args) if binary_args.strip() else []
+    net_badge   = '[red]BLOCKED[/red]' if not allow_net else '[yellow]ALLOWED[/yellow]'
 
-    strace_base = [
-        'strace',
-        '-f',                 # follow forks and threads
-        '-tt',                # timestamps: hh:mm:ss.usec
-        '-T',                 # time spent inside each syscall
-        '-e', 'trace=all',    # capture everything for full syscall counts
-        '-o', tmp_trace,
-        '--',
-    ]
+    strace_flags = ['-f', '-tt', '-T', '-e', 'trace=all']
 
-    if not allow_net and shutil.which('unshare'):
-        cmd = ['unshare', '--user', '--net', '--'] + strace_base + [binary_path] + binary_argv
-        iso = '[green]unshare --user --net[/green]'
+    # "Full" isolation: mount + pid namespace with a minimal chroot,
+    # plus network namespace unless the caller passed --allow-net.
+    root_dir       = os.path.join(tempfile.gettempdir(), f'lure-root-{uuid.uuid4().hex[:12]}')
+    fd, marker_path = tempfile.mkstemp(prefix='lure_marker_', suffix='.flag')
+    os.close(fd)
+    init_script_path = _write_root_init_script()
+
+    unshare_ns_flags = ['--user'] + ([] if allow_net else ['--net']) + \
+                        ['--mount', '--pid', '--fork', '--map-root-user']
+    full_cmd = (
+        ['unshare'] + unshare_ns_flags + ['--',
+         sys.executable, init_script_path,
+         root_dir, tmp_trace, marker_path, binary_path, '--']
+        + binary_argv
+    )
+    full_iso_label = (
+        'user + mount + pid (network allowed)' if allow_net
+        else 'user + net + mount + pid'
+    )
+
+    # Fallback: the pre-Task-11 behavior — user+net namespace only, no
+    # mount/pid namespace, no chroot. Used if mount-namespace setup
+    # fails, or straight away if `unshare` isn't installed at all.
+    strace_base_fallback = ['strace'] + strace_flags + ['-o', tmp_trace, '--']
+    if shutil.which('unshare'):
+        if allow_net:
+            fallback_cmd   = ['unshare', '--user', '--'] + strace_base_fallback + [binary_path] + binary_argv
+            fallback_label = 'user only (mount namespace unavailable, network allowed)'
+        else:
+            fallback_cmd   = ['unshare', '--user', '--net', '--'] + strace_base_fallback + [binary_path] + binary_argv
+            fallback_label = 'user + net (mount namespace unavailable)'
     else:
-        cmd = strace_base + [binary_path] + binary_argv
-        iso = ('[yellow]none  (--allow-net)[/yellow]'
-               if allow_net else '[red]unshare not found[/red]')
+        fallback_cmd   = strace_base_fallback + [binary_path] + binary_argv
+        fallback_label = 'none (--allow-net)' if allow_net else 'none (unshare not found)'
 
-    net_badge = '[red]BLOCKED[/red]' if not allow_net else '[yellow]ALLOWED[/yellow]'
+    use_mount_ns = shutil.which('unshare') is not None
 
     # ── Header ─────────────────────────────────────────────────────────────────
     console.print(Panel.fit(
@@ -911,51 +1104,81 @@ def _execute(binary_path, timeout, binary_args, allow_net, trace_out, tmp_trace,
         border_style='yellow',
         box=box.ROUNDED,
     ))
-    console.print(f'  [dim]Isolation  [/dim]{iso}')
-    console.print(f'  [dim]Tracer     [/dim][green]strace -f -tt -T[/green]')
-    console.print()
 
-    # ── Launch ─────────────────────────────────────────────────────────────────
-    # stdout/stderr are captured to a real file (not subprocess.PIPE) so a
-    # chatty binary can never deadlock us by filling an unread pipe buffer.
-    # stderr is redirected to the same fd as stdout so the two streams stay
-    # in true chronological order, exactly like a shell's `2>&1`.
-    start_time = time.time()
     try:
-        with open(tmp_output, 'wb') as out_f:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=out_f,
-                stderr=subprocess.STDOUT,
+        if use_mount_ns:
+            console.print(f'  [dim]Isolation  [/dim][green]{full_iso_label}[/green]')
+            console.print(f'  [dim]Tracer     [/dim][green]strace -f -tt -T[/green]')
+            console.print()
+
+            start_time = time.time()
+            proc, exit_code, elapsed, timed_out = _launch_and_wait(
+                full_cmd, timeout, tmp_output, tmp_trace, start_time
             )
-    except FileNotFoundError as exc:
-        console.print(f'[red]Launch failed:[/red] {exc}')
-        return
 
-    # ── Live feed thread ───────────────────────────────────────────────────────
-    stop_evt    = threading.Event()
-    feed_thread = threading.Thread(
-        target=_live_tail,
-        args=(tmp_trace, start_time, stop_evt),
-        daemon=True,
-    )
-    feed_thread.start()
+            if proc is not None and _marker_succeeded(marker_path):
+                iso_label = full_iso_label
+            else:
+                # Setup failed before the guest binary was ever reached
+                # (or the launch itself failed). Pull out any detail the
+                # init script printed to stderr — captured in tmp_output,
+                # which we must clear before the real attempt so it
+                # doesn't get mistaken for the guest's own output.
+                detail = ''
+                try:
+                    with open(tmp_output, 'r', errors='replace') as f:
+                        first_line = f.readline().strip()
+                    if first_line:
+                        detail = f' ({first_line})'
+                except OSError:
+                    pass
 
-    # ── Wait for binary ────────────────────────────────────────────────────────
-    timed_out = False
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        timed_out = True
+                console.print()
+                console.print(
+                    '[yellow]Warning: mount namespace unavailable.[/yellow]\n'
+                    '[yellow]Running with network isolation only.[/yellow]\n'
+                    f'[yellow]Host filesystem is visible to the binary.{detail}[/yellow]'
+                )
+                console.print()
 
-    elapsed   = time.time() - start_time
-    exit_code = proc.returncode
+                open(tmp_output, 'wb').close()
+                open(tmp_trace, 'wb').close()
 
-    time.sleep(0.25)
-    stop_evt.set()
-    feed_thread.join(timeout=3)
+                console.print(f'  [dim]Isolation  [/dim][yellow]{fallback_label}[/yellow]')
+                console.print(f'  [dim]Tracer     [/dim][green]strace -f -tt -T[/green]')
+                console.print()
+
+                start_time = time.time()
+                proc, exit_code, elapsed, timed_out = _launch_and_wait(
+                    fallback_cmd, timeout, tmp_output, tmp_trace, start_time
+                )
+                iso_label = fallback_label
+
+                if proc is None:
+                    return
+        else:
+            console.print(f'  [dim]Isolation  [/dim][yellow]{fallback_label}[/yellow]')
+            console.print(f'  [dim]Tracer     [/dim][green]strace -f -tt -T[/green]')
+            console.print()
+
+            start_time = time.time()
+            proc, exit_code, elapsed, timed_out = _launch_and_wait(
+                fallback_cmd, timeout, tmp_output, tmp_trace, start_time
+            )
+            iso_label = fallback_label
+
+            if proc is None:
+                return
+    finally:
+        try:
+            os.unlink(init_script_path)
+        except OSError:
+            pass
+        try:
+            os.unlink(marker_path)
+        except OSError:
+            pass
+        shutil.rmtree(root_dir, ignore_errors=True)
 
     # ── Exit line ──────────────────────────────────────────────────────────────
     console.print()
@@ -985,7 +1208,7 @@ def _execute(binary_path, timeout, binary_args, allow_net, trace_out, tmp_trace,
     # ── Full report ────────────────────────────────────────────────────────────
     events = _parse_full_trace(tmp_trace)
     label, triggers = _render_report(
-        binary_path, exit_code, elapsed, timed_out, events, tmp_output
+        binary_path, exit_code, elapsed, timed_out, events, tmp_output, iso_label
     )
 
     # ── Save report ───────────────────────────────────────────────────────────
