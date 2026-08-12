@@ -7,9 +7,16 @@ Isolation model (full):
   - Network namespace (blocks outbound by default)
   - Mount namespace + minimal read-only chroot
   - PID namespace
+  - seccomp-bpf syscall allow-list, applied to the guest binary only
+    (via a small compiled guest_wrapper — see _ROOT_INIT_SRC below —
+    so strace itself is never filtered and can keep tracing normally)
 
 Fallback (if mount namespace unavailable):
-  - User namespace + network namespace only
+  - User namespace + network namespace only, no seccomp
+
+Fallback (if seccomp/guest_wrapper unavailable but mount namespace
+is fine):
+  - Full mount+PID isolation, no seccomp
 
 Uses strace for behavioral observation.
 """
@@ -52,14 +59,32 @@ console = Console(record=True)
 # /dev nodes, and just enough of /etc for the dynamic linker to work.
 # This script is what actually runs INSIDE the new mount+pid namespace
 # (spawned by `unshare --mount --pid --fork ...`) — it sets the root
-# up, then execs into strace -> the guest binary.
+# up, compiles the guest_wrapper (see WRAPPER_C_SRC below) inside the
+# chroot, then execs into strace -> guest_wrapper -> the guest binary.
+# strace itself is never seccomp-filtered — only guest_wrapper (and,
+# once it installs the filter and execs, the guest binary) is.
 #
 # It writes a single byte to a pre-opened marker file immediately
-# before that final exec. That's the only reliable way to tell
-# "sandbox setup failed" apart from "the guest binary ran and exited"
-# — once we're past this point, the guest's own exit code looks
-# identical to a setup failure from the parent's point of view.
+# before the final exec. That's the only reliable way to tell "sandbox
+# setup failed" apart from "the guest binary ran and exited" — once
+# we're past this point, the guest's own exit code looks identical to
+# a setup failure from the parent's point of view. A SECOND, separate
+# marker tracks whether seccomp itself actually got installed: mount
+# namespace setup can succeed even when the guest_wrapper couldn't be
+# compiled or its filter couldn't be installed (e.g. no C compiler
+# available, or a kernel that rejects PR_SET_SECCOMP), and the parent
+# needs to report that distinction accurately in the isolation label.
 SETUP_FAILURE_EXIT = 97
+
+# guest_wrapper: a tiny, standalone C program installing a seccomp-bpf
+# allow-list on ITSELF before execve-ing into the real guest binary.
+# It is compiled at runtime, inside the chroot, by the init script
+# below — never on the host. See its own header comment (embedded
+# here verbatim) for the full design rationale, including two subtle
+# bugs that were caught and fixed via live kernel install tests during
+# development: a degenerate zero-distance BPF jump, and a no-match
+# fall-through path that could silently defeat the allow-list.
+WRAPPER_C_SRC = '/* lure-wrapper: installs a seccomp-bpf allow-list filter on ITSELF,\n * then execve\'s into the real guest binary. Compiled at runtime from\n * this embedded source, run by strace (which is NOT itself filtered --\n * only this wrapper and whatever it execs into are).\n *\n * Usage: lure-wrapper <guest_binary_path> <no_seccomp_marker_fd> [guest argv...]\n *\n * argv[0] passed to the guest binary is set to <guest_binary_path>\n * itself, so the guest sees a normal argv[0] as if it had been\n * exec\'d directly.\n *\n * If seccomp installation fails for any reason, this wrapper writes\n * a single byte to the pre-opened marker fd (passed as argv[2]) and\n * proceeds to exec the guest UNFILTERED rather than aborting the run.\n *\n * Note on socket family filtering: classic BPF seccomp can only see\n * raw syscall ARGUMENTS (register values), never memory a pointer\n * argument points to. socket(domain, type, protocol)\'s domain is a\n * plain integer in args[0], so it CAN be filtered directly (allowed\n * only for AF_UNIX below). connect/bind/sendto/recvfrom\'s first\n * argument is a file descriptor, not a family -- the actual family\n * was already decided when that fd\'s socket() call was made. Since\n * socket() itself is gated to AF_UNIX-only, any fd a guest can\n * legitimately hold already refers to an AF_UNIX socket, so those\n * four calls are safe to allow unconditionally at this layer.\n *\n * Note on the JEQ chain construction (read this before touching the\n * comparison-building code below): classic BPF jump offsets (jt/jf)\n * are 8-bit fields, and a jump of distance 0 is indistinguishable\n * from falling through to the next instruction. This means a flat\n * chain\'s LAST comparison can never correctly express "jump to the\n * instruction immediately after me" via jt alone -- so every chain\n * here ends with an explicit spacer instruction before its shared\n * match-landing RET, guaranteeing every jt is a real jump (>=1).\n *\n * CRITICALLY -- and this is the part that bit us hard during\n * development -- the LAST comparison\'s NO-MATCH path (jf) must ALSO\n * be handled explicitly: its natural fall-through lands on the\n * spacer, which unconditionally reaches this chain\'s own RET action.\n * Left alone, that silently applies this chain\'s match-action (e.g.\n * ALLOW) to every syscall that DIDN\'T match anything, defeating the\n * entire allow-list. Every chain below therefore gives its last\n * comparison a jf that explicitly skips PAST the spacer and RET,\n * landing on whatever the caller places immediately next (the real\n * default). Both the match and no-match paths for every single\n * comparison were exhaustively verified at generation time, not just\n * spot-checked, after this exact bug was caught live via a kernel\n * install test where an unlisted syscall (getppid) was silently\n * allowed through.\n */\n#include <stddef.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <unistd.h>\n#include <errno.h>\n#include <string.h>\n#include <linux/audit.h>\n#include <linux/filter.h>\n#include <linux/seccomp.h>\n#include <sys/prctl.h>\n#include <sys/syscall.h>\n\n#define SECCOMP_DATA_NR_OFFSET     0\n#define SECCOMP_DATA_ARCH_OFFSET   4\n#define SECCOMP_DATA_ARGS0_OFFSET 16\n\n#define SYS_SOCKET_NR 41\n#define AF_UNIX_VAL   1\n\n/* Allowed syscalls (178 total; \'socket\' is handled\n * separately below with an address-family condition, not listed\n * here). */\nstatic const int ALLOW_NRS[] = {\n    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,\n    12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,\n    24, 25, 26, 27, 28, 32, 33, 34, 35, 37, 39, 40,\n    42, 44, 45, 49, 53, 56, 57, 58, 59, 60, 61, 62,\n    63, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82,\n    83, 84, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95,\n    96, 97, 98, 99, 100, 102, 104, 105, 106, 107, 108, 109,\n    110, 111, 112, 115, 117, 118, 119, 120, 121, 124, 125, 126,\n    127, 128, 130, 131, 140, 141, 142, 143, 144, 145, 149, 150,\n    151, 152, 157, 158, 159, 160, 162, 186, 200, 201, 202, 203,\n    204, 213, 217, 218, 219, 228, 229, 230, 231, 232, 233, 234,\n    247, 253, 254, 255, 257, 258, 260, 262, 263, 264, 265, 266,\n    267, 268, 269, 270, 271, 273, 274, 281, 282, 283, 284, 286,\n    287, 289, 290, 291, 292, 293, 294, 297, 302, 306, 316, 318,\n    319, 322, 326, 332, 334, 435, 437, 439, 441, 449,\n};\n#define N_ALLOW ((int)(sizeof(ALLOW_NRS) / sizeof(ALLOW_NRS[0])))\n\n/* Explicitly blocked syscalls (32 total) -- these get\n * SIGSYS instead of falling through to the default EPERM, so a\n * guest attempting one of these is killed rather than just seeing a\n * failed call it might retry or work around. */\nstatic const int DENY_NRS[] = {\n    101, 103, 139, 155, 165, 166, 172, 173, 174, 175, 176, 178,\n    180, 183, 212, 246, 248, 249, 250, 272, 298, 303, 304, 308,\n    313, 317, 320, 321, 323, 425, 426, 427,\n};\n#define N_DENY ((int)(sizeof(DENY_NRS) / sizeof(DENY_NRS[0])))\n\n/* Appends a correctly-verified JEQ chain to `prog` starting at\n * `*pc`, testing each value in `nrs` (nrs_count entries) against the\n * syscall number already loaded into the BPF accumulator. On match,\n * jumps to a RET instruction (with k=ret_action_on_match) placed at\n * the end of this chain. On no match across ALL entries, execution\n * falls through to whatever the caller appends immediately next --\n * NOT to this chain\'s own RET. See the file header comment for why\n * this distinction is safety-critical. Advances *pc past the emitted\n * instructions (nrs_count + 2: the comparisons, one spacer, one RET).\n */\nstatic void append_chain(struct sock_filter *prog, int *pc,\n                          const int *nrs, int nrs_count,\n                          unsigned int ret_action_on_match) {\n    int base = *pc;\n    for (int i = 0; i < nrs_count; i++) {\n        int jt = nrs_count - i;  /* on match: land on RET (index base+nrs_count+1) */\n        int jf = 0;              /* on no match: fall through to next comparison */\n        if (i == nrs_count - 1) {\n            /* Last entry: no-match must skip PAST the spacer and RET\n             * (2 instructions) to reach the caller\'s next instruction. */\n            jf = 2;\n        }\n        prog[*pc] = (struct sock_filter)\n            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (unsigned int)nrs[i], jt, jf);\n        (*pc)++;\n    }\n    prog[*pc] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JA | BPF_K, 0, 0, 0);  /* spacer */\n    (*pc)++;\n    prog[*pc] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, ret_action_on_match);\n    (*pc)++;\n\n    /* Exhaustive self-check before this filter is ever installed:\n     * every comparison\'s match path must land exactly on the RET\n     * instruction just emitted, and the last comparison\'s no-match\n     * path must land exactly one instruction past it. A mismatch\n     * here means a real bug in this function, not the syscall list --\n     * abort loudly rather than install a silently-broken filter. */\n    int ret_idx = base + nrs_count + 1;\n    int after_idx = ret_idx + 1;\n    for (int i = 0; i < nrs_count; i++) {\n        int idx = base + i;\n        int landing_match = idx + 1 + prog[idx].jt;\n        if (landing_match != ret_idx) {\n            fprintf(stderr, "lure-wrapper: internal error: chain entry %d match-lands on %d, want %d\\n",\n                    i, landing_match, ret_idx);\n            abort();\n        }\n        if (i == nrs_count - 1) {\n            int landing_nomatch = idx + 1 + prog[idx].jf;\n            if (landing_nomatch != after_idx) {\n                fprintf(stderr, "lure-wrapper: internal error: last chain entry no-match lands on %d, want %d\\n",\n                        landing_nomatch, after_idx);\n                abort();\n            }\n        }\n    }\n}\n\n/* Returns 0 on success, -1 on failure (errno set). */\nstatic int install_seccomp_filter(void) {\n    /* Layout:\n     *   0: LD_ABS arch\n     *   1: JEQ AUDIT_ARCH_X86_64 -> continue(1) : KILL_PROCESS(0)\n     *   2: RET KILL_PROCESS          (wrong architecture entirely)\n     *   3: LD_ABS nr\n     *   deny chain (N_DENY entries + spacer + RET TRAP)\n     *   socket nr check -> either the 2-instruction family sub-check,\n     *                      or fall through to the plain allow chain\n     *   allow chain (N_ALLOW entries + spacer + RET ALLOW)\n     *   DEFAULT:           RET ERRNO(EPERM)\n     */\n    struct sock_filter prog[32 + N_DENY + N_ALLOW];\n    int pc = 0;\n\n    prog[pc++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET);\n    prog[pc++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0);\n    prog[pc++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);\n    prog[pc++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET);\n\n    append_chain(prog, &pc, DENY_NRS, N_DENY, SECCOMP_RET_TRAP);\n\n    /* socket() family gate: nr still holds the value from the LD_ABS\n     * above (BPF has a single accumulator; the deny chain only ever\n     * COMPARES nr, never reloads it). On nr==socket, check args[0];\n     * on nr!=socket, skip straight to the plain allow chain. */\n    prog[pc++] = (struct sock_filter)\n        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_SOCKET_NR, 0, 2);\n    prog[pc++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARGS0_OFFSET);\n\n    int allow_ret_idx = pc + 1 + N_ALLOW + 1;  /* +1 for the AF-check instruction itself */\n    int allow_default_idx = allow_ret_idx + 1;\n\n    /* Computed on separate lines, BEFORE the prog[pc++] statement below:\n     * reading `pc` inside the same expression that also modifies it via\n     * `pc++` is unsequenced behavior in C, and was silently miscomputing\n     * these two values by exactly 1 during development (caught via a\n     * live kernel install test where AF_INET sockets were incorrectly\n     * allowed through). Never inline a jump-distance expression that\n     * reads `pc` directly into a `prog[pc++] = ...` statement. */\n    int af_jt = allow_ret_idx - pc - 1;\n    int af_jf = allow_default_idx - pc - 1;\n    prog[pc++] = (struct sock_filter)\n        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX_VAL, af_jt, af_jf);\n\n    append_chain(prog, &pc, ALLOW_NRS, N_ALLOW, SECCOMP_RET_ALLOW);\n\n    prog[pc++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM);\n\n    /* Verify the AF-check\'s computed targets actually matched reality\n     * (defensive: if append_chain\'s layout ever changes, this catches\n     * a stale offset computation immediately instead of installing a\n     * silently-wrong filter). */\n    if (pc - 1 != allow_default_idx) {\n        fprintf(stderr, "lure-wrapper: internal error: default EPERM at %d, expected %d\\n",\n                pc - 1, allow_default_idx);\n        abort();\n    }\n\n    struct sock_fprog fprog = { (unsigned short)pc, prog };\n\n    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {\n        return -1;\n    }\n    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fprog, 0, 0) != 0) {\n        return -1;\n    }\n    return 0;\n}\n\nint main(int argc, char **argv) {\n    if (argc < 3) {\n        fprintf(stderr, "lure-wrapper: usage: lure-wrapper <guest_path> <marker_fd> [args...]\\n");\n        return 126;\n    }\n\n    const char *guest_path = argv[1];\n    int marker_fd = atoi(argv[2]);\n\n    if (install_seccomp_filter() != 0) {\n        /* Best-effort: tell the parent seccomp didn\'t take, then\n         * proceed WITHOUT it rather than aborting the run. */\n        if (marker_fd >= 0) {\n            ssize_t written = write(marker_fd, "1", 1);\n            (void)written;  /* nothing more we can do if this fails */\n            close(marker_fd);\n        }\n        fprintf(stderr, "lure-wrapper: seccomp install failed (errno=%d), running without it\\n", errno);\n    } else {\n        if (marker_fd >= 0) {\n            close(marker_fd);  /* leave marker empty: filter succeeded */\n        }\n    }\n\n    /* argv[3..] (if any) become the guest\'s own argv[1..]; the guest\'s\n     * argv[0] is set to guest_path itself. */\n    int guest_argc = argc - 3;\n    char **guest_argv = malloc((size_t)(guest_argc + 2) * sizeof(char *));\n    if (!guest_argv) {\n        fprintf(stderr, "lure-wrapper: out of memory\\n");\n        return 126;\n    }\n    guest_argv[0] = (char *)guest_path;\n    for (int i = 0; i < guest_argc; i++) {\n        guest_argv[1 + i] = argv[3 + i];\n    }\n    guest_argv[1 + guest_argc] = NULL;\n\n    execv(guest_path, guest_argv);\n\n    /* execv only returns on failure */\n    fprintf(stderr, "lure-wrapper: execv(%s) failed: %s\\n", guest_path, strerror(errno));\n    return 127;\n}\n'
 
 _ROOT_INIT_SRC = '''\
 import os
@@ -81,29 +106,38 @@ DEV_NODES = (
     ('tty',     0o666, 5, 0),
 )
 
+WRAPPER_C_SRC = ''' + repr(WRAPPER_C_SRC) + '''
+
 
 def fail(msg):
     sys.stderr.write(f'lure_root_init: {msg}\\n')
-    sys.exit(''' + str(SETUP_FAILURE_EXIT) + ''')
+    sys.exit(97)
 
 
 def main():
-    if len(sys.argv) < 6 or sys.argv[5] != '--':
+    if len(sys.argv) < 7 or sys.argv[6] != '--':
         fail('internal error: bad argv from lure')
 
-    root_dir, trace_path, marker_path, binary_path = sys.argv[1:5]
-    extra_argv = sys.argv[6:]
+    root_dir, trace_path, marker_path, no_seccomp_marker_path, binary_path = sys.argv[1:6]
+    extra_argv = sys.argv[7:]
+
+    wrapper_ready = False
+    wrapper_bin_path = '/tmp/lure-wrapper'
 
     try:
         for d in SKELETON_DIRS:
             os.makedirs(os.path.join(root_dir, d), exist_ok=True)
 
-        # Pre-open both files BEFORE chroot, while host paths still
-        # resolve normally. trace_fd must survive the exec into
-        # strace below, so it is explicitly marked inheritable.
+        # Pre-open all three files BEFORE chroot, while host paths
+        # still resolve normally. trace_fd and no_seccomp_fd must
+        # survive the exec chain below, so they are explicitly marked
+        # inheritable. marker_fd does not need to survive exec — it is
+        # written and closed entirely within this script.
         trace_fd = os.open(trace_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         os.set_inheritable(trace_fd, True)
         marker_fd = os.open(marker_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        no_seccomp_fd = os.open(no_seccomp_marker_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        os.set_inheritable(no_seccomp_fd, True)
 
         # Essential device nodes. Best-effort: some environments deny
         # mknod even inside a fresh user+mount namespace -- silently
@@ -119,8 +153,10 @@ def main():
                 pass
 
         # tmpfs on /tmp so a guest can't fill the host disk under the
-        # temp root. Non-fatal: /tmp stays a plain (unbounded) directory
-        # if this mount fails for any reason.
+        # temp root, and so there is somewhere writable to compile
+        # guest_wrapper into after chroot (the rest of the root is
+        # read-only). Non-fatal: /tmp stays a plain (unbounded)
+        # directory if this mount fails for any reason.
         subprocess.run(
             ['mount', '-t', 'tmpfs', '-o', 'size=64m,mode=1777', 'tmpfs',
              os.path.join(root_dir, 'tmp')],
@@ -155,26 +191,90 @@ def main():
         shutil.copy2(binary_path, guest_path_in_root)
         os.chmod(guest_path_in_root, 0o755)
 
+        # Write the guest_wrapper C source into the (still-writable,
+        # pre-chroot) tmpfs /tmp, ready to compile once inside the
+        # chroot below.
+        wrapper_src_path = os.path.join(root_dir, 'tmp', 'lure-wrapper.c')
+        with open(wrapper_src_path, 'w') as f:
+            f.write(WRAPPER_C_SRC)
+
         os.chdir(root_dir)
         os.chroot(root_dir)
         os.chdir('/')
 
+        # Compile guest_wrapper INSIDE the chroot -- gcc/cc, headers,
+        # and the C library it needs are all reachable via the
+        # read-only /usr bind mount; the compiler writes its output to
+        # /tmp (tmpfs, writable). If this fails for any reason (no
+        # compiler available, compile error), that is NOT treated as a
+        # setup failure -- mount namespace + chroot still succeeded,
+        # so lure proceeds tracing the guest directly, just without
+        # seccomp, exactly like the mount-namespace-unavailable
+        # fallback already does one level up.
+        compiler = None
+        for candidate in ('cc', 'gcc'):
+            if shutil.which(candidate):
+                compiler = candidate
+                break
+
+        if compiler:
+            compile_result = subprocess.run(
+                [compiler, '-O2', '-o', wrapper_bin_path, '/tmp/lure-wrapper.c'],
+                capture_output=True, text=True,
+            )
+            wrapper_ready = (compile_result.returncode == 0
+                              and os.path.exists(wrapper_bin_path))
+            if not wrapper_ready:
+                sys.stderr.write(
+                    'lure_root_init: guest_wrapper compile failed, '
+                    'running guest without seccomp: '
+                    + compile_result.stderr[-500:] + '\\n'
+                )
+        else:
+            sys.stderr.write(
+                'lure_root_init: no C compiler available in sandbox, '
+                'running guest without seccomp\\n'
+            )
+
     except Exception as exc:
         fail(f'setup failed: {exc}')
 
-    # Setup is fully complete. Mark success now, before touching the
-    # guest binary at all.
+    # Mount namespace + chroot setup is fully complete. Mark success
+    # now, before touching the guest binary or guest_wrapper at all.
     os.write(marker_fd, b'1')
     os.close(marker_fd)
 
-    strace_cmd = [
-        'strace',
-        '-f', '-tt', '-T',
-        '-e', 'trace=all',
-        '-o', f'/proc/self/fd/{trace_fd}',
-        '--',
-        f'/{guest_name}',
-    ] + extra_argv
+    if not wrapper_ready:
+        # No usable guest_wrapper (compiler missing or compile
+        # failed): tell the parent seccomp will not be active, then
+        # trace the guest binary directly -- same behavior as before
+        # Task 13, just reported accurately in the isolation label.
+        try:
+            os.write(no_seccomp_fd, b'1')
+        except OSError:
+            pass
+        os.close(no_seccomp_fd)
+
+        strace_cmd = [
+            'strace', '-f', '-tt', '-T', '-e', 'trace=all',
+            '-o', f'/proc/self/fd/{trace_fd}',
+            '--', f'/{guest_name}',
+        ] + extra_argv
+    else:
+        # no_seccomp_fd is inherited by guest_wrapper itself, which is
+        # responsible for writing to it if IT fails to install the
+        # filter (e.g. a kernel that rejects PR_SET_SECCOMP even
+        # though mount namespaces and compilation both worked) --
+        # guest_wrapper still execs the guest either way, just
+        # unfiltered in that case. strace traces guest_wrapper, not
+        # the guest directly, so strace's own ptrace-based tracing is
+        # never subject to the filter guest_wrapper installs on itself
+        # immediately before its own exec into the guest.
+        strace_cmd = [
+            'strace', '-f', '-tt', '-T', '-e', 'trace=all',
+            '-o', f'/proc/self/fd/{trace_fd}',
+            '--', wrapper_bin_path, f'/{guest_name}', str(no_seccomp_fd),
+        ] + extra_argv
 
     try:
         os.execvp('strace', strace_cmd)
@@ -1119,6 +1219,8 @@ def _execute(binary_path, timeout, binary_args, allow_net, trace_out, tmp_trace,
 
     fd, marker_path = tempfile.mkstemp(prefix='lure_marker_', suffix='.flag')
     os.close(fd)
+    fd, no_seccomp_marker_path = tempfile.mkstemp(prefix='lure_noseccomp_', suffix='.flag')
+    os.close(fd)
     init_script_path = _write_root_init_script()
 
     unshare_ns_flags = ['--user'] + ([] if allow_net else ['--net']) + \
@@ -1126,12 +1228,16 @@ def _execute(binary_path, timeout, binary_args, allow_net, trace_out, tmp_trace,
     full_cmd = (
         ['unshare'] + unshare_ns_flags + ['--',
          sys.executable, init_script_path,
-         root_dir, tmp_trace, marker_path, binary_path, '--']
+         root_dir, tmp_trace, marker_path, no_seccomp_marker_path, binary_path, '--']
         + binary_argv
     )
-    full_iso_label = (
-        'user + mount + pid (network allowed)' if allow_net
-        else 'user + net + mount + pid'
+    full_iso_label_seccomp    = (
+        'user + mount + pid + seccomp (network allowed)' if allow_net
+        else 'user + net + mount + pid + seccomp'
+    )
+    full_iso_label_no_seccomp = (
+        'user + mount + pid (network allowed, no seccomp)' if allow_net
+        else 'user + net + mount + pid (no seccomp)'
     )
 
     # Fallback: the pre-Task-11 behavior — user+net namespace only, no
@@ -1163,7 +1269,7 @@ def _execute(binary_path, timeout, binary_args, allow_net, trace_out, tmp_trace,
 
     try:
         if use_mount_ns:
-            console.print(f'  [dim]Isolation  [/dim][green]{full_iso_label}[/green]')
+            console.print('  [dim]Isolation  [/dim][dim]setting up mount namespace + sandbox...[/dim]')
             console.print(f'  [dim]Tracer     [/dim][green]strace -f -tt -T[/green]')
             console.print()
 
@@ -1173,7 +1279,18 @@ def _execute(binary_path, timeout, binary_args, allow_net, trace_out, tmp_trace,
             )
 
             if proc is not None and _marker_succeeded(marker_path):
-                iso_label = full_iso_label
+                # Mount namespace + chroot succeeded. Whether seccomp
+                # itself is active depends on the SEPARATE no-seccomp
+                # marker, written by the init script (compiler missing
+                # or compile failed) or by guest_wrapper itself
+                # (PR_SET_SECCOMP rejected) — either way, an empty
+                # marker here means seccomp genuinely installed.
+                if _marker_succeeded(no_seccomp_marker_path):
+                    iso_label = full_iso_label_no_seccomp
+                else:
+                    iso_label = full_iso_label_seccomp
+                console.print(f'  [dim]Isolation  [/dim][green]{iso_label}[/green]')
+                console.print()
             else:
                 # Setup failed before the guest binary was ever reached
                 # (or the launch itself failed). Pull out any detail the
@@ -1232,6 +1349,10 @@ def _execute(binary_path, timeout, binary_args, allow_net, trace_out, tmp_trace,
             pass
         try:
             os.unlink(marker_path)
+        except OSError:
+            pass
+        try:
+            os.unlink(no_seccomp_marker_path)
         except OSError:
             pass
         shutil.rmtree(root_dir, ignore_errors=True)

@@ -4,7 +4,7 @@
 
 ![Lure demo](assets/demo.gif)
 
-⚠️ **Early development (v0.4.1).** Core features (`inspect`, `run`,
+⚠️ **Early development (v0.5.0).** Core features (`inspect`, `run`,
 `diff`) work end to end on x86_64 Linux. This is a young project —
 expect rough edges, limited error handling on unusual inputs, and
 missing features. Bug reports, feedback, and contributions are very
