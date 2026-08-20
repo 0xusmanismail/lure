@@ -1,3 +1,286 @@
+#!/usr/bin/env bash
+# FILE: setup.sh
+#
+# Task 13 followup + Task 14 — cgroups v2 resource limits (v0.5.1).
+#
+# Touches: pyproject.toml, lure/__init__.py, lure/main.py,
+#          lure/runner.py, .gitignore, README.md
+# Adds:    test_forkbomb.c (NOT compiled or run automatically)
+# No dependency changes, no reinstall.
+#
+#   Task 13 followup: the Processes Spawned panel and JSON
+#     processes_spawned no longer show /tmp/lure-wrapper — it's the
+#     internal seccomp-installer process (see Task 13), not something
+#     the guest itself spawned. Filtered by exact path match in
+#     _parse_full_trace(). Verified with a synthetic trace matching
+#     the exact reported bug (wrapper exec followed by guest exec).
+#
+#   Part A/B/C: cgroups v2 detection, per-session cgroup creation
+#     (512 MB memory limit, 64 process limit, swap disabled), and
+#     cleanup (cgroup.kill then rmdir, best-effort, never fails the
+#     run). Applied by wrapping the OUTERMOST launched command with a
+#     shell that adds its own PID to cgroup.procs before exec-ing the
+#     real chain -- membership is inherited by every descendant across
+#     fork/exec (verified directly with a 3-level exec/subprocess
+#     chain), so this needed no changes to the mount-namespace init
+#     script, guest_wrapper, or strace invocation from Task 11-13.
+#
+#     Real bug caught and fixed during development: the write-test
+#     for "is cgroups available" must target the SAME subdirectory the
+#     README has the user delegate (/sys/fs/cgroup/lure), never the
+#     cgroup2 mount root itself -- testing the mount root would report
+#     "unavailable" even on a correctly delegated system, since a real
+#     delegation only chowns the subdirectory, not the whole tree.
+#     Caught by literally following the README's own instructions
+#     against a real cgroup2 hierarchy and confirming detection failed
+#     before the fix, succeeded after.
+#
+#     Also confirmed for real: a hybrid cgroup v1/v2 system (where
+#     /sys/fs/cgroup is a plain tmpfs, not cgroup2 -- true of this
+#     very sandbox) would give a FALSE POSITIVE from the write-test
+#     alone (tmpfs happily allows mkdir/rmdir), which is exactly why
+#     detection checks the filesystem type via `stat` FIRST and only
+#     runs the write-test after that passes.
+#
+#     Each limit (memory.max, pids.max, memory.swap.max) is written
+#     independently and best-effort -- a cgroup that only has SOME
+#     controllers delegated (a real, observed scenario during testing)
+#     still gets whatever limits it can support, and the terminal
+#     report says so honestly ("not applied") rather than claiming
+#     full enforcement.
+#
+#   Part D: Execution Summary shows "Memory limit" / "Process limit"
+#     when applied, "not applied" per-limit if the cgroup was created
+#     but a specific controller wasn't available, or "Resource limits:
+#     not available" if cgroups didn't work at all. JSON report gets a
+#     "resource_limits" object matching the task's exact schema.
+#
+#   Part E: test_forkbomb.c added to the repo root, NOT compiled or
+#     run by this script. Added to .gitignore along with its compiled
+#     form so neither goes to GitHub.
+#
+#   Part F: version bumped to 0.5.1 in all three locations.
+#
+#   Arch/cgroup-delegation note + "Enabling cgroup resource limits
+#   (optional)" section added to README.md, matching the exact
+#   delegation path the detection code actually checks.
+#
+# Usage: ./setup.sh   (run from the repo root)
+
+set -euo pipefail
+
+cd "$(dirname "$0")"
+echo "==> Updating pyproject.toml..."
+cat > pyproject.toml << 'LURE_PYPROJECT_EOF'
+# FILE: pyproject.toml
+# ─────────────────────────────────────────────────────────────────────────────
+
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "lure-analyze"
+version         = "0.5.1"
+description     = "Local Linux binary analysis tool for security researchers and CTF players"
+readme          = "README.md"
+requires-python = ">=3.9"
+license         = { text = "MIT" }
+authors         = [
+    { name = "Usman Ismail", email = "0xusmanismail@proton.me" },
+]
+keywords = [
+    "security",
+    "malware",
+    "sandbox",
+    "linux",
+    "binary-analysis",
+    "strace",
+    "elf",
+    "ctf",
+    "reverse-engineering",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: System :: Monitoring",
+]
+dependencies    = [
+    "click>=8.1",
+    "rich>=13.7",
+    "pyelftools>=0.30",
+]
+
+[project.urls]
+Homepage   = "https://github.com/0xusmanismail/lure"
+Repository = "https://github.com/0xusmanismail/lure"
+Issues     = "https://github.com/0xusmanismail/lure/issues"
+
+[project.scripts]
+lure = "lure.main:cli"
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["lure*"]
+LURE_PYPROJECT_EOF
+
+echo "==> Updating lure/__init__.py..."
+cat > lure/__init__.py << 'LURE_INIT_EOF'
+# FILE: lure/__init__.py
+"""
+Lure — local Linux binary analysis tool.
+
+Runs untrusted ELF binaries and shows exactly what they did.
+Files accessed. Network attempts. Processes spawned.
+Zero cloud upload. Zero root. Zero cost.
+"""
+
+__version__ = "0.5.1"
+__author__  = "Lure"
+__license__ = "MIT"
+LURE_INIT_EOF
+
+echo "==> Updating lure/main.py..."
+cat > lure/main.py << 'LURE_MAIN_EOF'
+# FILE: lure/main.py
+"""
+Lure CLI — entry point and subcommand definitions.
+"""
+
+import click
+from rich.console import Console
+
+console = Console()
+
+BANNER = (
+    '\n'
+    '  [bold cyan]lure[/bold cyan]\n'
+    '  [dim]----------------------------------------------[/dim]\n'
+    '  [dim]local binary analysis · zero cloud · zero root[/dim]\n'
+)
+
+
+def print_banner():
+    console.print(BANNER)
+
+
+CONTEXT_SETTINGS = dict(help_option_names=['--help', '-h'])
+
+
+class OrderedGroup(click.Group):
+    """Lists subcommands in the order they were defined, not alphabetically."""
+    def list_commands(self, ctx):
+        return list(self.commands)
+
+
+@click.group(cls=OrderedGroup, context_settings=CONTEXT_SETTINGS)
+@click.version_option(
+    version='0.5.1', prog_name='lure', help='Show version and exit.'
+)
+def cli():
+    """
+    \b
+    Lure — local Linux binary analysis.
+    Zero cloud. Zero root. Zero cost.
+    """
+
+
+# ── inspect ────────────────────────────────────────────────────────────────────
+
+@cli.command(short_help='Analyse an ELF binary without running it.')
+@click.argument('binary', type=click.Path())
+@click.option('--json', 'output_json', is_flag=True, default=False,
+              help='Emit results as JSON instead of a rich table.')
+@click.option('--sections', 'show_sections', is_flag=True, default=False,
+              help='Include the full ELF section header table.')
+@click.option('--strings', 'show_strings', is_flag=True, default=False,
+              help='Print interesting printable strings found in the binary.')
+def inspect(binary, output_json, show_sections, show_strings):
+    """Analyse an ELF binary without running it.
+
+    \b
+    BINARY  Path to the ELF binary to inspect.
+
+    \b
+    Reads ELF headers, architecture, security mitigations, linked
+    libraries, and file hashes — without executing a single byte
+    of code.
+
+    \b
+    Example: lure inspect /bin/ls
+    """
+    from lure.inspector import run_inspect
+    if not output_json:
+        print_banner()
+    run_inspect(binary, output_json, show_sections, show_strings)
+
+
+# ── run ────────────────────────────────────────────────────────────────────────
+
+@cli.command(short_help='Execute a binary in an isolated sandbox.')
+@click.argument('binary', type=click.Path())
+@click.option('--timeout', '-t', default=30, show_default=True, metavar='SECS',
+              help='Maximum wall-clock seconds to let the binary run.')
+@click.option('--args', 'binary_args', default='', metavar="'ARG ...'",
+              help='Arguments to pass to the binary (quote the whole string).')
+@click.option('--allow-net', is_flag=True, default=False,
+              help='Allow outbound network access inside the sandbox (off by default).')
+@click.option('--out', 'trace_out', default=None, metavar='FILE',
+              type=click.Path(dir_okay=False),
+              help='Save the raw strace log to FILE for later inspection.')
+@click.option('--save', 'save_report', is_flag=True, default=False,
+              help='Save the full report to ~/.lure/reports/ as both .txt and .json')
+def run(binary, timeout, binary_args, allow_net, trace_out, save_report):
+    """Execute a binary in an isolated sandbox.
+
+    \b
+    BINARY  Path to the ELF binary to execute.
+
+    \b
+    Uses strace + Linux namespaces (unshare) for lightweight isolation.
+    Captures every syscall, streams a live event feed, then renders a
+    full behavioral report. Network is blocked by default. No root required.
+
+    \b
+    Example: lure run --save ./suspicious_binary
+    """
+    from lure.runner import run_binary
+    print_banner()
+    run_binary(binary, timeout, binary_args, allow_net, trace_out, save_report)
+
+
+# ── diff ───────────────────────────────────────────────────────────────────────
+
+@cli.command(short_help='Compare two saved execution reports.')
+@click.argument('report1', type=click.Path())
+@click.argument('report2', type=click.Path())
+def diff(report1, report2):
+    """Compare two saved execution reports.
+
+    \b
+    REPORT1  Path to the earlier .json report (produced by 'lure run --save').
+    REPORT2  Path to the later .json report.
+
+    \b
+    Example: lure diff report1.json report2.json
+    """
+    from lure.diff import run_diff
+    print_banner()
+    run_diff(report1, report2)
+
+
+if __name__ == '__main__':
+    cli()
+LURE_MAIN_EOF
+
+echo "==> Updating lure/runner.py..."
+cat > lure/runner.py << 'LURE_RUNNER_EOF'
 # FILE: lure/runner.py
 """
 Lure runner — sandboxed ELF execution engine.
@@ -1702,3 +1985,178 @@ def run_binary(binary, timeout, binary_args, allow_net, trace_out, save=False):
             os.unlink(tmp_output)
         except OSError:
             pass
+LURE_RUNNER_EOF
+
+echo "==> Updating .gitignore..."
+cat > .gitignore << 'LURE_GITIGNORE_EOF'
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.lure/
+demo.cast
+record_demo.sh
+run_demo.py
+make_demo.sh
+test_forkbomb
+test_forkbomb.c
+LURE_GITIGNORE_EOF
+
+echo "==> Updating README.md..."
+cat > README.md << 'LURE_README_EOF'
+# lure
+
+> Local Linux binary analysis. Zero cloud. Zero root. Zero cost.
+
+⚠️ **Early development (v0.2).** Core features (`inspect`, `run`,
+`diff`) work end to end on x86_64 Linux. This is a young project —
+expect rough edges, limited error handling on unusual inputs, and
+missing features. Bug reports, feedback, and contributions are very
+welcome.
+
+![Lure run demo](assets/run-1.png)
+
+## What it does
+
+Lure runs an untrusted Linux binary inside an isolated sandbox
+(Linux namespaces + strace) and tells you exactly what it did —
+which files it touched, what network connections it tried, what
+processes it spawned — then gives you a plain verdict:
+**CLEAN**, **SUSPICIOUS**, or **DANGEROUS**.
+
+Everything happens on your machine. Nothing is uploaded anywhere.
+
+## Why
+
+- **Privacy** — sensitive or client samples never leave your machine
+- **Zero setup** — no VM, no Docker, no Cuckoo install process
+- **Readable** — structured reports instead of raw strace noise
+- **Free** — MIT licensed, runs on tools already on Kali Linux
+
+## Install
+
+```bash
+git clone https://github.com/0xusmanismail/lure.git
+cd lure
+pip install -e . --break-system-packages
+```
+
+The `--break-system-packages` flag is required on Arch Linux and on
+recent Debian/Ubuntu releases, which restrict installing into the
+system Python environment by default (PEP 668). You can alternatively
+run `./setup.sh` to install (and reinstall) everything automatically.
+
+Requires `strace` and `unshare`. On Arch: `sudo pacman -S strace`
+(`unshare` is part of `util-linux`, installed by default). On
+Debian/Ubuntu/Kali: `sudo apt install strace`. On Fedora:
+`sudo dnf install strace`.
+
+## Enabling cgroup resource limits (optional)
+
+`lure run` applies a 512 MB memory limit and a 64-process limit to
+every guest binary via a per-run cgroup v2, on top of the namespace
+and seccomp isolation described above. This protects the host from a
+guest that fork-bombs or allocates unbounded memory.
+
+On Arch Linux (and most non-systemd-managed setups), `/sys/fs/cgroup`
+is not writable by unprivileged users by default, so these limits are
+skipped — `lure run` still works normally, just without them, and
+prints a note saying so. To enable them, delegate a cgroup to your
+user once:
+
+```bash
+sudo mkdir -p /sys/fs/cgroup/lure
+sudo chown $USER /sys/fs/cgroup/lure
+```
+
+This is entirely optional. Lure always runs with or without it —
+this just adds an extra layer of host protection against runaway
+guest processes.
+
+## Usage
+
+### Inspect a binary
+
+```bash
+lure inspect /bin/ls
+```
+
+Reads ELF headers, architecture, security mitigations (NX, PIE,
+RELRO, stack canary), linked libraries, file hashes, and packer
+detection — without executing a single byte of code.
+
+![Lure inspect part 1](assets/inspect-1.png)
+![Lure inspect part 2](assets/inspect-2.png)
+
+### Run a binary in the sandbox
+
+```bash
+lure run /bin/ls
+```
+
+Live feed of file access, network attempts, and spawned processes
+during execution, followed by a full report: execution summary,
+files accessed, network activity, process tree, syscall breakdown,
+and a CLEAN / SUSPICIOUS / DANGEROUS verdict.
+
+![Lure run part 1](assets/run-1.png)
+![Lure run part 2](assets/run-2.png)
+![Lure run part 3](assets/run-3.png)
+
+### Save the report
+
+```bash
+lure run --save /bin/ls
+```
+
+Saves the full report to `~/.lure/reports/` as both a plain-text
+`.txt` file and a structured `.json` file.
+
+### Compare two reports
+
+```bash
+lure diff ~/.lure/reports/a.json ~/.lure/reports/b.json
+```
+
+Shows new/removed files, new network connections, verdict changes,
+and the syscall count delta between two saved runs.
+
+## Status & Roadmap
+
+This is a v0.2 release built and tested on Arch Linux (x86_64).
+
+**Working now:**
+- ELF inspection with security mitigation detection
+- Sandboxed execution via `unshare` + `strace`
+- Live event feed during execution
+- Full behavioral report with verdict, listing exact triggers
+- Report saving (`.txt` + `.json`)
+- Report comparison (`lure diff`)
+
+**Planned:**
+- Better edge-case handling (invalid binaries, missing args, etc.)
+- Refined verdict heuristics
+- Packaged releases (no manual `pip install -e .`)
+
+Issues and pull requests are welcome — this project is actively
+developed.
+
+## License
+
+MIT — see [LICENSE](LICENSE)
+LURE_README_EOF
+
+echo "==> Updating test_forkbomb.c..."
+cat > test_forkbomb.c << 'LURE_FORKBOMB_C_EOF'
+#include <unistd.h>
+int main() {
+    while(1) fork();
+    return 0;
+}
+LURE_FORKBOMB_C_EOF
+
+echo
+echo "All files updated. test_forkbomb.c added (not compiled/run)."

@@ -10,4 +10,5 @@ demo.cast
 record_demo.sh
 run_demo.py
 make_demo.sh
-setup.sh
+test_forkbomb
+test_forkbomb.c

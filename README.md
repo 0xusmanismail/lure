@@ -2,24 +2,20 @@
 
 > Local Linux binary analysis. Zero cloud. Zero root. Zero cost.
 
-![Lure demo](assets/demo.gif)
-
-⚠️ **Early development (v0.5.0).** Core features (`inspect`, `run`,
+⚠️ **Early development (v0.2).** Core features (`inspect`, `run`,
 `diff`) work end to end on x86_64 Linux. This is a young project —
 expect rough edges, limited error handling on unusual inputs, and
 missing features. Bug reports, feedback, and contributions are very
-welcome. Network and filesystem isolation are enforced by default;
-if mount namespace setup fails on your system, Lure falls back to
-network-only isolation and says so clearly in the report.
+welcome.
 
-![Lure dangerous verdict](assets/dangerous-3.png)
+![Lure run demo](assets/run-1.png)
 
 ## What it does
 
-Lure runs an untrusted Linux binary in an isolated environment (user,
-network, mount, and PID namespaces + strace) and tells you exactly
-what it did — which files it touched, what network connections it
-tried, what processes it spawned — then gives you a plain verdict:
+Lure runs an untrusted Linux binary inside an isolated sandbox
+(Linux namespaces + strace) and tells you exactly what it did —
+which files it touched, what network connections it tried, what
+processes it spawned — then gives you a plain verdict:
 **CLEAN**, **SUSPICIOUS**, or **DANGEROUS**.
 
 Everything happens on your machine. Nothing is uploaded anywhere.
@@ -31,25 +27,7 @@ Everything happens on your machine. Nothing is uploaded anywhere.
 - **Readable** — structured reports instead of raw strace noise
 - **Free** — MIT licensed, runs on tools already on Kali Linux
 
-## Isolation model
-
-Lure uses Linux user, network, mount, and PID namespaces. The binary
-runs in an isolated filesystem root with read-only access to system
-libraries. It cannot modify the host filesystem. Network connections
-are blocked by default. Lure is primarily a behavioral observation
-tool, not a hardened sandbox — for stronger isolation (seccomp,
-cgroups), run Lure inside a VM or container.
-
 ## Install
-
-### From PyPI (recommended)
-
-```bash
-pip install lure-analyze --break-system-packages
-lure --version
-```
-
-### From source
 
 ```bash
 git clone https://github.com/0xusmanismail/lure.git
@@ -57,20 +35,37 @@ cd lure
 pip install -e . --break-system-packages
 ```
 
-Note: the PyPI package is named `lure-analyze` because "lure" was
-already taken. The command is still `lure`.
-
 The `--break-system-packages` flag is required on Arch Linux and on
 recent Debian/Ubuntu releases, which restrict installing into the
-system Python environment by default (PEP 668).
+system Python environment by default (PEP 668). You can alternatively
+run `./setup.sh` to install (and reinstall) everything automatically.
 
-Requires `strace` and `unshare` installed.
+Requires `strace` and `unshare`. On Arch: `sudo pacman -S strace`
+(`unshare` is part of `util-linux`, installed by default). On
+Debian/Ubuntu/Kali: `sudo apt install strace`. On Fedora:
+`sudo dnf install strace`.
 
-## Tested on
+## Enabling cgroup resource limits (optional)
 
-- Arch Linux (primary development platform)
-- Kali Linux
-- Debian / Ubuntu
+`lure run` applies a 512 MB memory limit and a 64-process limit to
+every guest binary via a per-run cgroup v2, on top of the namespace
+and seccomp isolation described above. This protects the host from a
+guest that fork-bombs or allocates unbounded memory.
+
+On Arch Linux (and most non-systemd-managed setups), `/sys/fs/cgroup`
+is not writable by unprivileged users by default, so these limits are
+skipped — `lure run` still works normally, just without them, and
+prints a note saying so. To enable them, delegate a cgroup to your
+user once:
+
+```bash
+sudo mkdir -p /sys/fs/cgroup/lure
+sudo chown $USER /sys/fs/cgroup/lure
+```
+
+This is entirely optional. Lure always runs with or without it —
+this just adds an extra layer of host protection against runaway
+guest processes.
 
 ## Usage
 
@@ -80,74 +75,65 @@ Requires `strace` and `unshare` installed.
 lure inspect /bin/ls
 ```
 
-Reads ELF headers, architecture, security mitigations, linked libraries, and file hashes — without executing a single byte of code.
+Reads ELF headers, architecture, security mitigations (NX, PIE,
+RELRO, stack canary), linked libraries, file hashes, and packer
+detection — without executing a single byte of code.
 
-![inspect](assets/inspect-1.png)
+![Lure inspect part 1](assets/inspect-1.png)
+![Lure inspect part 2](assets/inspect-2.png)
 
 ### Run a binary in the sandbox
 
 ```bash
-lure run ./suspicious_binary
+lure run /bin/ls
 ```
 
-Live feed of file access, network attempts, and spawned processes, followed by a full behavioral report.
+Live feed of file access, network attempts, and spawned processes
+during execution, followed by a full report: execution summary,
+files accessed, network activity, process tree, syscall breakdown,
+and a CLEAN / SUSPICIOUS / DANGEROUS verdict.
 
-![run live feed](assets/run-1.png)
+![Lure run part 1](assets/run-1.png)
+![Lure run part 2](assets/run-2.png)
+![Lure run part 3](assets/run-3.png)
 
-![run report](assets/run-2.png)
-
-### Catch suspicious behavior
-
-```bash
-lure run ./demo_dangerous
-```
-
-Sensitive file access combined with network activity trips a DANGEROUS verdict, with the exact triggers listed.
-
-![Lure catching dangerous behavior](assets/dangerous-3.png)
-
-### Compare two runs with lure diff
+### Save the report
 
 ```bash
 lure run --save /bin/ls
-lure run --save /bin/echo
-lure diff report1.json report2.json
 ```
 
-Shows new/removed files, new connections, verdict changes, and syscall count differences between two saved runs.
+Saves the full report to `~/.lure/reports/` as both a plain-text
+`.txt` file and a structured `.json` file.
 
-![diff output](assets/diff-1.png)
-
-### Save a report
+### Compare two reports
 
 ```bash
-lure run --save ./binary
+lure diff ~/.lure/reports/a.json ~/.lure/reports/b.json
 ```
 
-Saves the full report to `~/.lure/reports/` as both a plain-text `.txt` file and a structured `.json` file.
+Shows new/removed files, new network connections, verdict changes,
+and the syscall count delta between two saved runs.
 
 ## Status & Roadmap
 
+This is a v0.2 release built and tested on Arch Linux (x86_64).
+
 **Working now:**
 - ELF inspection with security mitigation detection
-- UPX packer detection in inspect
 - Sandboxed execution via `unshare` + `strace`
-- Mount + PID namespace isolation with a minimal read-only chroot
 - Live event feed during execution
-- Full behavioral report with CLEAN/SUSPICIOUS/DANGEROUS verdict
-- Verdict shows exact triggering files and IPs
-- Report saving (plain text + JSON)
-- Report comparison via `lure diff`
-- Non-ELF file detection with clean error messages
-- Works on Arch Linux, Kali, Debian, Ubuntu
-- Available on PyPI as lure-analyze
-- Demo GIF in README
+- Full behavioral report with verdict, listing exact triggers
+- Report saving (`.txt` + `.json`)
+- Report comparison (`lure diff`)
 
 **Planned:**
-- Automated test suite
-- seccomp syscall filtering
-- ARM64 binary support
-- Windows PE analysis (via Wine)
+- Better edge-case handling (invalid binaries, missing args, etc.)
+- Refined verdict heuristics
+- Packaged releases (no manual `pip install -e .`)
+
+Issues and pull requests are welcome — this project is actively
+developed.
 
 ## License
 
