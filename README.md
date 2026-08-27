@@ -2,138 +2,437 @@
 
 > Local Linux binary analysis. Zero cloud. Zero root. Zero cost.
 
-⚠️ **Early development (v0.2).** Core features (`inspect`, `run`,
-`diff`) work end to end on x86_64 Linux. This is a young project —
-expect rough edges, limited error handling on unusual inputs, and
-missing features. Bug reports, feedback, and contributions are very
-welcome.
+**lure** is a local Linux ELF analysis and sandboxing tool for security researchers, reverse engineers, and CTF players.
 
-![Lure run demo](assets/run-1.png)
+It provides three complementary workflows:
 
-## What it does
+- **Static analysis** with `lure inspect` — inspect an ELF without executing it.
+- **Behavioral analysis** with `lure run` — execute an ELF under Linux namespaces, `strace`, and a seccomp-bpf policy, then produce a readable report.
+- **Report comparison** with `lure diff` — compare two saved behavioral reports.
 
-Lure runs an untrusted Linux binary inside an isolated sandbox
-(Linux namespaces + strace) and tells you exactly what it did —
-which files it touched, what network connections it tried, what
-processes it spawned — then gives you a plain verdict:
-**CLEAN**, **SUSPICIOUS**, or **DANGEROUS**.
+Everything is processed locally. No sample or report is uploaded to a cloud service.
 
-Everything happens on your machine. Nothing is uploaded anywhere.
+> **Alpha software:** lure is still under active development. Test it in an environment appropriate for security research and do not treat this sandbox as a replacement for a dedicated malware-analysis VM.
 
-## Why
+## Features
 
-- **Privacy** — sensitive or client samples never leave your machine
-- **Zero setup** — no VM, no Docker, no Cuckoo install process
-- **Readable** — structured reports instead of raw strace noise
-- **Free** — MIT licensed, runs on tools already on Kali Linux
+### Static ELF inspection
 
-## Install
+`lure inspect` reports:
+
+- ELF architecture and type
+- Endianness
+- File size
+- MD5 and SHA-256 hashes
+- NX
+- PIE
+- RELRO status
+- Stack-canary presence
+- Linked libraries
+- ELF section headers with `--sections`
+- Printable ASCII strings with `--strings`
+
+The inspected file is not executed.
+
+### Sandboxed execution
+
+`lure run` combines:
+
+- Linux user namespaces
+- A network namespace
+- A mount namespace
+- A PID namespace
+- `strace` syscall tracing
+- A seccomp-bpf syscall policy applied to the guest
+- A minimal sandbox filesystem
+- A timeout (30 seconds by default)
+- Optional network access with `--allow-net`
+- Optional raw `strace` output
+- Optional TXT + JSON reports
+- Best-effort cgroups v2 resource limits when available
+
+Network access is blocked by default.
+
+The seccomp policy uses an allow-list, an explicit deny-list, a default `EPERM` action, an architecture check, and a `socket()` family check. The exact syscall policy is an implementation detail and may change between releases.
+
+### Report comparison
+
+`lure diff` compares two JSON reports and shows:
+
+- New files
+- Removed files
+- New network connections
+- Verdict changes
+- Syscall-count changes
+
+## Installation
+
+### From PyPI
+
+The package name on PyPI is **`lure-analyze`**, while the installed command is **`lure`**.
+
+```bash
+python -m pip install lure-analyze
+```
+
+Then verify:
+
+```bash
+lure --version
+```
+
+For the `v0.6.0` release:
+
+```text
+lure, version 0.6.0
+```
+
+### From source
 
 ```bash
 git clone https://github.com/0xusmanismail/lure.git
 cd lure
-pip install -e . --break-system-packages
+python -m pip install -e .
 ```
 
-The `--break-system-packages` flag is required on Arch Linux and on
-recent Debian/Ubuntu releases, which restrict installing into the
-system Python environment by default (PEP 668). You can alternatively
-run `./setup.sh` to install (and reinstall) everything automatically.
+If your Linux distribution enforces PEP 668 for the system Python, use an appropriate virtual environment or your distribution's recommended packaging workflow rather than forcing installation into the system interpreter.
 
-Requires `strace` and `unshare`. On Arch: `sudo pacman -S strace`
-(`unshare` is part of `util-linux`, installed by default). On
-Debian/Ubuntu/Kali: `sudo apt install strace`. On Fedora:
-`sudo dnf install strace`.
-
-## Enabling cgroup resource limits (optional)
-
-`lure run` applies a 512 MB memory limit and a 64-process limit to
-every guest binary via a per-run cgroup v2, on top of the namespace
-and seccomp isolation described above. This protects the host from a
-guest that fork-bombs or allocates unbounded memory.
-
-On Arch Linux (and most non-systemd-managed setups), `/sys/fs/cgroup`
-is not writable by unprivileged users by default, so these limits are
-skipped — `lure run` still works normally, just without them, and
-prints a note saying so. To enable them, delegate a cgroup to your
-user once:
+### Development dependencies
 
 ```bash
-sudo mkdir -p /sys/fs/cgroup/lure
-sudo chown $USER /sys/fs/cgroup/lure
+python -m pip install -e ".[dev]"
 ```
 
-This is entirely optional. Lure always runs with or without it —
-this just adds an extra layer of host protection against runaway
-guest processes.
+## System requirements
 
-## Usage
+- Linux
+- Python 3.9+
+- `strace`
+- `unshare` (provided by `util-linux` on common Linux distributions)
 
-### Inspect a binary
+Install the required system tools with your distribution's package manager.
+
+### Arch Linux
+
+```bash
+sudo pacman -S strace util-linux
+```
+
+### Debian / Ubuntu / Kali
+
+```bash
+sudo apt install strace util-linux
+```
+
+### Fedora
+
+```bash
+sudo dnf install strace util-linux
+```
+
+## Quick start
+
+### Inspect an ELF
 
 ```bash
 lure inspect /bin/ls
 ```
 
-Reads ELF headers, architecture, security mitigations (NX, PIE,
-RELRO, stack canary), linked libraries, file hashes, and packer
-detection — without executing a single byte of code.
+JSON output:
 
-![Lure inspect part 1](assets/inspect-1.png)
-![Lure inspect part 2](assets/inspect-2.png)
+```bash
+lure inspect --json /bin/ls
+```
 
-### Run a binary in the sandbox
+Include section headers:
+
+```bash
+lure inspect --sections /bin/ls
+```
+
+Extract printable strings:
+
+```bash
+lure inspect --strings /bin/ls
+```
+
+Combine options:
+
+```bash
+lure inspect --json --sections --strings /bin/ls
+```
+
+### Run an ELF
 
 ```bash
 lure run /bin/ls
 ```
 
-Live feed of file access, network attempts, and spawned processes
-during execution, followed by a full report: execution summary,
-files accessed, network activity, process tree, syscall breakdown,
-and a CLEAN / SUSPICIOUS / DANGEROUS verdict.
-
-![Lure run part 1](assets/run-1.png)
-![Lure run part 2](assets/run-2.png)
-
-### Save the report
+Set a timeout:
 
 ```bash
-lure run --save /bin/ls
+lure run --timeout 10 ./sample
 ```
 
-Saves the full report to `~/.lure/reports/` as both a plain-text
-`.txt` file and a structured `.json` file.
-
-### Compare two reports
+Pass arguments to the guest:
 
 ```bash
-lure diff ~/.lure/reports/a.json ~/.lure/reports/b.json
+lure run --args '--help' ./sample
 ```
 
-Shows new/removed files, new network connections, verdict changes,
-and the syscall count delta between two saved runs.
+Allow outbound network access:
 
-## Status & Roadmap
+```bash
+lure run --allow-net ./sample
+```
 
-This is a v0.2 release built and tested on Arch Linux (x86_64).
+> Network access is disabled by default. Only enable it when you understand the risk and your analysis environment permits it.
 
-**Working now:**
-- ELF inspection with security mitigation detection
-- Sandboxed execution via `unshare` + `strace`
-- Live event feed during execution
-- Full behavioral report with verdict, listing exact triggers
-- Report saving (`.txt` + `.json`)
-- Report comparison (`lure diff`)
+Save the raw `strace` log:
 
-**Planned:**
-- Better edge-case handling (invalid binaries, missing args, etc.)
-- Refined verdict heuristics
-- Packaged releases (no manual `pip install -e .`)
+```bash
+lure run --out trace.log ./sample
+```
 
-Issues and pull requests are welcome — this project is actively
-developed.
+Save the full report:
+
+```bash
+lure run --save ./sample
+```
+
+Saved reports are written under:
+
+```text
+~/.lure/reports/
+```
+
+A saved run produces a human-readable `.txt` transcript and a structured `.json` report.
+
+### Compare reports
+
+```bash
+lure diff report1.json report2.json
+```
+
+For example:
+
+```bash
+lure diff ~/.lure/reports/run-a.json ~/.lure/reports/run-b.json
+```
+
+## Isolation model
+
+The execution path is designed as **layered isolation**, not as a single security boundary.
+
+### Normal path
+
+The runner uses:
+
+1. A user namespace
+2. A network namespace
+3. A mount namespace
+4. A PID namespace
+5. A minimal sandbox filesystem
+6. `strace` for observation
+7. A seccomp-bpf filter for the guest process
+8. Best-effort cgroups v2 resource limits when the host permits them
+
+The guest is not given host root privileges. The sandbox uses read-only filesystem mounts where appropriate.
+
+### Seccomp
+
+The seccomp policy is deliberately separate from `strace`: the filter is installed for the guest wrapper and guest binary so tracing can continue.
+
+The policy includes:
+
+- an allow-list
+- an explicit deny-list that produces `SIGSYS`
+- a default `EPERM` action
+- an architecture check
+- a `socket()` family check
+
+The current implementation contains 178 allowed syscall numbers plus a separate explicit deny-list. This is an implementation detail and may change between releases.
+
+### Resource limits
+
+When cgroups v2 are available and delegated for use, lure attempts to apply:
+
+- **512 MiB** memory maximum
+- **64** processes maximum
+- swap disabled
+
+These limits are best-effort. If cgroups are unavailable, the run continues and the report records that resource limits were not active.
+
+### Fallback behavior
+
+If parts of the isolation stack are unavailable, lure can fall back to a weaker configuration rather than claiming full isolation.
+
+In particular, the runner can fall back when:
+
+- mount-namespace setup is unavailable, or
+- the seccomp wrapper/filter cannot be used.
+
+The reported isolation mode should be checked for security-sensitive analysis. When stronger containment is required, use an external isolation boundary such as a dedicated VM.
+
+## CLI reference
+
+### `lure`
+
+```text
+lure [OPTIONS] COMMAND [ARGS]...
+```
+
+### `lure inspect`
+
+```text
+lure inspect [OPTIONS] BINARY
+```
+
+Options:
+
+```text
+--json
+--sections
+--strings
+```
+
+### `lure run`
+
+```text
+lure run [OPTIONS] BINARY
+```
+
+Options:
+
+```text
+-t, --timeout SECS
+--args 'ARG ...'
+--allow-net
+--out FILE
+--save
+```
+
+### `lure diff`
+
+```text
+lure diff REPORT1 REPORT2
+```
+
+## Reports
+
+A saved JSON report contains structured data including:
+
+```text
+binary
+full_path
+timestamp
+runtime_seconds
+exit_code
+isolation
+resource_limits
+verdict
+verdict_triggers
+files_accessed
+network_attempts
+processes_spawned
+syscall_total
+```
+
+The behavioral verdict is one of:
+
+```text
+CLEAN
+SUSPICIOUS
+DANGEROUS
+```
+
+The JSON report is intended to make runs easy to archive, inspect, and compare.
+
+## Error handling
+
+`lure inspect` rejects invalid or non-ELF input and exits non-zero on validation failures.
+
+`lure run` validates that the target exists, is executable, is non-empty, and is an ELF before attempting execution. It also requires `strace`.
+
+The test suite covers inspection, execution, diffing, flags, timeouts, report schemas, and edge cases.
+
+## Development
+
+Install development dependencies:
+
+```bash
+python -m pip install -e ".[dev]"
+```
+
+Run the test suite:
+
+```bash
+python -m pytest
+```
+
+The project uses pytest for automated tests.
+
+When changing sandbox behavior, update the tests and documentation together. Security-sensitive changes should be tested on the Linux environments they are intended to support.
+
+## Project layout
+
+```text
+lure/
+├── lure/
+│   ├── main.py
+│   ├── inspector.py
+│   ├── runner.py
+│   └── diff.py
+├── tests/
+│   ├── test_inspect.py
+│   ├── test_run.py
+│   ├── test_diff.py
+│   └── test_edge_cases.py
+├── assets/
+├── pyproject.toml
+├── requirements.txt
+├── CONTRIBUTING.md
+├── LICENSE
+└── README.md
+```
+
+## Versioning
+
+The `v0.6.0` release corresponds to package version `0.6.0`.
+
+The Python package is published as:
+
+```text
+lure-analyze
+```
+
+The CLI command is:
+
+```text
+lure
+```
+
+## Limitations
+
+- Linux-only.
+- The sandbox depends on kernel and namespace capabilities available on the host.
+- Isolation can fall back when required kernel features or the seccomp wrapper are unavailable.
+- Resource limits depend on cgroups v2 availability and delegation.
+- `lure inspect` currently targets ELF files.
+- The project is Alpha software and should not be considered a complete malware-analysis environment.
+
+## Contributing
+
+Issues and pull requests are welcome.
+
+For development setup and contribution guidelines, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+MIT — see [`LICENSE`](LICENSE).
+
+## Links
+
+- [Repository](https://github.com/0xusmanismail/lure)
+- [Issues](https://github.com/0xusmanismail/lure/issues)
+- [PyPI](https://pypi.org/project/lure-analyze/)
