@@ -1,579 +1,358 @@
 # FILE: lure/inspector.py
 """
-ELF binary inspection engine for 'lure inspect'.
-Parses headers, security mitigations, libraries, and strings
-without executing a single byte of code.
+Lure inspector — static ELF analysis without execution.
+
+Public interface
+----------------
+NOT_ELF_ERROR           str  — standard error text for non-ELF inputs
+is_elf_file(path)       bool — True iff the file starts with the ELF magic bytes
+run_inspect(...)        None — entry point called by `lure inspect`
+
+All validation errors call sys.exit(1) so `lure inspect` exits non-zero
+on bad input, matching the contract of `lure run`.
+
+JSON output schema (--json flag)
+---------------------------------
+{
+    "binary":     str,
+    "full_path":  str,
+    "size_bytes": int,
+    "hashes":     {"md5": str, "sha256": str},
+    "elf": {
+        "arch":   str,   # "x86-64", "ARM64", …
+        "type":   str,   # "ET_DYN", "ET_EXEC", …
+        "endian": str    # "little" | "big"
+    },
+    "security": {
+        "nx":     bool,
+        "pie":    bool,
+        "relro":  str,   # "full" | "partial" | "none"
+        "canary": bool
+    },
+    "libraries": [str],
+    "sections":  [...],  # only when --sections
+    "strings":   [str]   # only when --strings
+}
 """
 
-import os
-import re
-import json
-import stat
 import hashlib
-import datetime
+import json
+import os
+import sys
 from pathlib import Path
 
+from elftools.elf.dynamic import DynamicSection
 from elftools.elf.elffile import ELFFile
 from elftools.elf.sections import SymbolTableSection
-
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich import box
 
 console = Console()
 
+NOT_ELF_ERROR = (
+    'Error: not a valid ELF binary \u2014 '
+    'lure can only analyse ELF files'
+)
 
-# ── ELF validation ────────────────────────────────────────────────────────────
 
-ELF_MAGIC     = b'\x7fELF'
-NOT_ELF_ERROR = 'Error: not a valid ELF binary. Lure only supports Linux ELF files.'
+# ── low-level helpers ─────────────────────────────────────────────────────────
 
-
-def is_elf_file(filepath: str) -> bool:
-    """True if the first 4 bytes of `filepath` match the ELF magic number."""
+def is_elf_file(path: str) -> bool:
+    """Return True if *path* is a readable file whose first 4 bytes are the
+    ELF magic number (0x7f 'E' 'L' 'F')."""
     try:
-        with open(filepath, 'rb') as f:
-            return f.read(4) == ELF_MAGIC
+        with open(path, 'rb') as fh:
+            return fh.read(4) == b'\x7fELF'
     except OSError:
         return False
 
 
-# ── Lookup tables ─────────────────────────────────────────────────────────────
-
-ARCH_MAP = {
-    'EM_NONE':    'Unknown',
-    'EM_386':     'x86 (32-bit)',
-    'EM_X86_64':  'x86-64',
-    'EM_ARM':     'ARM (32-bit)',
-    'EM_AARCH64': 'ARM64 (AArch64)',
-    'EM_MIPS':    'MIPS',
-    'EM_PPC':     'PowerPC (32-bit)',
-    'EM_PPC64':   'PowerPC (64-bit)',
-    'EM_S390':    'IBM S/390',
-    'EM_RISCV':   'RISC-V',
-    'EM_IA_64':   'Itanium (IA-64)',
-    'EM_SPARC':   'SPARC',
-}
-
-TYPE_MAP = {
-    'ET_NONE': 'Unknown',
-    'ET_REL':  'Relocatable Object',
-    'ET_EXEC': 'Static Executable',
-    'ET_DYN':  'Shared Object/PIE Executable',
-    'ET_CORE': 'Core Dump',
-}
+def _file_hashes(path: str) -> dict:
+    md5    = hashlib.md5()
+    sha256 = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        for chunk in iter(lambda: fh.read(65536), b''):
+            md5.update(chunk)
+            sha256.update(chunk)
+    return {'md5': md5.hexdigest(), 'sha256': sha256.hexdigest()}
 
 
-# ── ELF analysis ──────────────────────────────────────────────────────────────
-
-def _md5(filepath: str) -> str:
-    h = hashlib.md5()
-    with open(filepath, 'rb') as f:
-        for chunk in iter(lambda: f.read(65536), b''):
-            h.update(chunk)
-    return h.hexdigest()
+def _human_size(n: int) -> str:
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if n < 1024:
+            return f'{n} {unit}'
+        n //= 1024
+    return f'{n} TB'
 
 
-def _sha256(filepath: str) -> str:
-    h = hashlib.sha256()
-    with open(filepath, 'rb') as f:
-        for chunk in iter(lambda: f.read(65536), b''):
-            h.update(chunk)
-    return h.hexdigest()
+# ── ELF attribute extractors ──────────────────────────────────────────────────
+
+def _get_arch(elf: ELFFile) -> str:
+    raw = elf.get_machine_arch()
+    return {
+        'x64':       'x86-64',
+        'x86':       'x86',
+        'AArch64':   'ARM64',
+        'ARM':       'ARM',
+        'MIPS':      'MIPS',
+        'PowerPC64': 'PPC64',
+        'IBM S/390': 'S/390',
+    }.get(raw, raw)
 
 
-def _check_nx(elf) -> bool:
-    """NX enabled when PT_GNU_STACK segment lacks the execute bit."""
+def _get_security(elf: ELFFile) -> dict:
+    """Detect NX, PIE, partial/full RELRO, and stack canary."""
+    nx     = True            # assumed enabled; cleared if PT_GNU_STACK has PF_X
+    pie    = elf['e_type'] == 'ET_DYN'
+    relro  = 'none'
+    canary = False
+
     for seg in elf.iter_segments():
-        if seg.header.p_type == 'PT_GNU_STACK':
-            return not bool(seg.header.p_flags & 0x1)   # PF_X = 0x1
-    return True   # absent PT_GNU_STACK -> kernel default: NX on
+        pt = seg['p_type']
+        if pt == 'PT_GNU_STACK':
+            # PF_X = 0x1 — if the execute bit is set, the stack is executable
+            nx = not bool(seg['p_flags'] & 0x1)
+        elif pt == 'PT_GNU_RELRO':
+            relro = 'partial'
 
-
-def _check_pie(elf) -> bool:
-    """PIE executables are compiled as ET_DYN shared objects."""
-    return elf.header.e_type == 'ET_DYN'
-
-
-def _check_relro(elf) -> str:
-    """Classify RELRO protection as 'full', 'partial', or 'none'."""
-    has_relro_seg = any(
-        seg.header.p_type == 'PT_GNU_RELRO'
-        for seg in elf.iter_segments()
-    )
-    if not has_relro_seg:
-        return 'none'
-
-    dyn = elf.get_section_by_name('.dynamic')
-    if dyn:
-        for tag in dyn.iter_tags():
-            d = tag.entry.d_tag
-            v = tag.entry.d_val
-            if d == 'DT_BIND_NOW':
-                return 'full'
-            if d == 'DT_FLAGS'   and (v & 0x8):   # DF_BIND_NOW
-                return 'full'
-            if d == 'DT_FLAGS_1' and (v & 0x1):   # DF_1_NOW
-                return 'full'
-    return 'partial'
-
-
-def _check_canary(elf) -> bool:
-    """Stack canary present when __stack_chk_fail is imported."""
-    targets = {'__stack_chk_fail', '__stack_chk_guard'}
-    for sec_name in ('.dynsym', '.symtab'):
-        sec = elf.get_section_by_name(sec_name)
-        if sec and isinstance(sec, SymbolTableSection):
-            for sym in sec.iter_symbols():
-                if sym.name in targets:
-                    return True
-    return False
-
-
-def _check_stripped(elf) -> bool:
-    """Binary is stripped when .symtab is absent or contains only the null entry."""
-    sec = elf.get_section_by_name('.symtab')
-    if sec is None:
-        return True
-    return sec.num_symbols() <= 1
-
-
-def _check_upx(elf, filepath: str) -> bool:
-    """Detect UPX packing via section names or the UPX! magic bytes."""
     for sec in elf.iter_sections():
-        if 'UPX' in sec.name.upper():
-            return True
-    try:
-        with open(filepath, 'rb') as f:
-            data = f.read(65536)
-        if b'UPX!' in data:
-            return True
-    except OSError:
-        pass
-    return False
+        if isinstance(sec, DynamicSection):
+            for tag in sec.iter_tags():
+                d_tag = tag.entry.d_tag
+                d_val = tag.entry.d_val
+                # DF_BIND_NOW (DT_FLAGS bit 3) or DF_1_NOW (DT_FLAGS_1 bit 0)
+                # both mean full RELRO when combined with PT_GNU_RELRO.
+                if d_tag == 'DT_FLAGS'   and (d_val & 0x8):
+                    relro = 'full'
+                if d_tag == 'DT_FLAGS_1' and (d_val & 0x1):
+                    relro = 'full'
+        if isinstance(sec, SymbolTableSection):
+            try:
+                for sym in sec.iter_symbols():
+                    if sym.name == '__stack_chk_fail':
+                        canary = True
+                        break
+            except Exception:
+                pass
+
+    return {'nx': nx, 'pie': pie, 'relro': relro, 'canary': canary}
 
 
-def _is_dynamic(elf) -> bool:
-    """Dynamically linked binaries have a PT_INTERP segment (the loader path)."""
-    return any(seg.header.p_type == 'PT_INTERP' for seg in elf.iter_segments())
-
-
-def _get_libraries(elf) -> list:
-    """Return DT_NEEDED library names from the .dynamic section."""
+def _get_libraries(elf: ELFFile) -> list:
     libs = []
-    dyn = elf.get_section_by_name('.dynamic')
-    if dyn:
-        for tag in dyn.iter_tags():
-            if tag.entry.d_tag == 'DT_NEEDED':
-                libs.append(tag.needed)
+    for sec in elf.iter_sections():
+        if isinstance(sec, DynamicSection):
+            for tag in sec.iter_tags():
+                if tag.entry.d_tag == 'DT_NEEDED':
+                    libs.append(tag.needed)
     return libs
 
 
-def _get_sections_data(elf) -> list:
+def _get_sections(elf: ELFFile) -> list:
+    """Return a list of dicts; ALL values are pre-converted to str so that
+    Rich Table.add_row() never receives a raw int and crashes."""
     return [
         {
-            'name':    sec.name,
-            'type':    sec.header.sh_type,
-            'address': sec.header.sh_addr,
-            'size':    sec.header.sh_size,
+            'name':   str(sec.name or '(none)'),
+            'type':   str(sec['sh_type']),
+            'offset': str(hex(sec['sh_offset'])),
+            'size':   str(sec['sh_size']),
         }
         for sec in elf.iter_sections()
-        if sec.name
     ]
 
 
-def _extract_strings(filepath: str, min_len: int = 8) -> list:
-    """
-    Scan raw bytes for printable ASCII runs and tag each by category.
-    Returns up to 200 results sorted by category priority.
-    """
-    PATTERNS = {
-        'url':     re.compile(r'https?://[^\x00\s]{6,}'),
-        'ip':      re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b'),
-        'path':    re.compile(r'/[a-zA-Z][a-zA-Z0-9_/.-]{5,}'),
-        'shell':   re.compile(
-            r'\b(bash|/bin/sh|python3?|perl|ruby|exec|system|'
-            r'popen|chmod|chown|wget|curl|ncat|nmap|base64)\b'
-        ),
-        'env_var': re.compile(r'\b[A-Z][A-Z0-9_]{3,}='),
-    }
-    results = []
-    raw_pat = re.compile(b'[ -~]{' + str(min_len).encode() + b',}')
-    try:
-        with open(filepath, 'rb') as f:
-            data = f.read()
-        for m in raw_pat.finditer(data):
-            s = m.group().decode('ascii', errors='ignore')
-            for cat, pat in PATTERNS.items():
-                if pat.search(s):
-                    results.append({
-                        'string':   s,
-                        'offset':   m.start(),
-                        'category': cat,
-                    })
-                    break
-    except OSError:
-        pass
-    return results[:200]
+def _get_strings(path: str, min_len: int = 6, cap: int = 200) -> list:
+    """Extract printable ASCII strings (>= min_len chars) from the binary."""
+    results: list = []
+    cur: list     = []
+    with open(path, 'rb') as fh:
+        for byte in fh.read():
+            if 0x20 <= byte <= 0x7E:
+                cur.append(chr(byte))
+            else:
+                if len(cur) >= min_len:
+                    s = ''.join(cur)
+                    if s not in results:
+                        results.append(s)
+                        if len(results) >= cap:
+                            break
+                cur = []
+    return results
 
 
-# ── Rich helpers ──────────────────────────────────────────────────────────────
-
-def _ok(label: str)       -> Text:
-    return Text.assemble(('✔  ', 'bold green'),  (label, 'green'))
-
-def _bad(label: str)      -> Text:
-    return Text.assemble(('✘  ', 'bold red'),    (label, 'red'))
-
-def _warn_txt(label: str) -> Text:
-    return Text.assemble(('⚠ ', 'bold yellow'), (label, 'yellow'))
-
-def _half(label: str)     -> Text:
-    return Text.assemble(('◑  ', 'bold yellow'), (label, 'yellow'))
-
-
-def _kv_panel(rows: list, title: str, border: str = 'dim white') -> Panel:
-    """Two-column key/value table wrapped in a rounded Panel."""
-    t = Table(box=None, show_header=False, show_edge=False, padding=(0, 1))
-    t.add_column(style='dim', no_wrap=True, min_width=15)
-    t.add_column(no_wrap=False)
-    for key, val in rows:
-        t.add_row(key, val)
-    return Panel(
-        t,
-        title=f'[bold]{title}[/bold]',
-        border_style=border,
-        box=box.ROUNDED,
-        padding=(0, 1),
-    )
-
-
-# ── Panels ────────────────────────────────────────────────────────────────────
-
-def _security_panel(nx: bool, pie: bool, relro: str, canary: bool) -> Panel:
-    t = Table(
-        box=box.SIMPLE_HEAD,
-        show_header=True,
-        header_style='bold dim',
-        padding=(0, 2),
-        expand=True,
-    )
-    t.add_column('Feature',     style='white', no_wrap=True,  min_width=16)
-    t.add_column('Status',      no_wrap=True,                 min_width=20)
-    t.add_column('Description', style='dim',   no_wrap=False)
-
-    t.add_row(
-        'NX',
-        _ok('Enabled')  if nx else _bad('Disabled'),
-        'Stack and heap pages are not executable',
-    )
-    t.add_row(
-        'PIE',
-        _ok('Enabled')  if pie else _bad('Disabled'),
-        'Binary loads at a randomised base address (ASLR)',
-    )
-    if relro == 'full':
-        t.add_row('RELRO', _ok('Full'),
-                  'GOT is fully read-only after initialisation')
-    elif relro == 'partial':
-        t.add_row('RELRO', _half('Partial'),
-                  'GOT partially protected — GOT PLT still writable')
-    else:
-        t.add_row('RELRO', _bad('None'),
-                  'GOT is writable — overwrite attacks possible')
-    t.add_row(
-        'Stack Canary',
-        _ok('Present') if canary else _bad('Absent'),
-        'Stack overflow detection via __stack_chk_fail',
-    )
-
-    return Panel(
-        t,
-        title='[bold]Security Features[/bold]',
-        border_style='dim white',
-        box=box.ROUNDED,
-        padding=(0, 1),
-    )
-
-
-def _libraries_panel(libs: list) -> Panel:
-    if not libs:
-        body = Text(
-            '  (statically linked — no shared libraries)',
-            style='dim italic',
-        )
-    else:
-        t = Table(box=None, show_header=False, show_edge=False, padding=(0, 1))
-        t.add_column()
-        for lib in libs:
-            t.add_row(Text(f'  {lib}', style='cyan'))
-        body = t
-
-    count = f'[bold]{len(libs)}[/bold]'
-    return Panel(
-        body,
-        title=f'[bold]Linked Libraries[/bold] ({count})',
-        border_style='dim white',
-        box=box.ROUNDED,
-        padding=(0, 1),
-    )
-
-
-def _sections_panel(sections: list, bits: int) -> Panel:
-    addr_width = 16 if bits == 64 else 8
-    t = Table(
-        box=box.SIMPLE_HEAD,
-        show_header=True,
-        header_style='bold dim',
-        padding=(0, 1),
-        expand=True,
-    )
-    t.add_column('Name',    style='cyan',  no_wrap=True, min_width=24)
-    t.add_column('Type',    style='white', no_wrap=True, min_width=20)
-    t.add_column('Address', style='green', no_wrap=True,
-                 min_width=addr_width + 4, justify='right')
-    t.add_column('Size',    style='white', no_wrap=True,
-                 min_width=10, justify='right')
-
-    for sec in sections:
-        addr     = f'0x{sec["address"]:0{addr_width}x}' if sec['address'] else '—'
-        sz       = sec['size']
-        size_str = f'{sz / 1024:.1f} KB' if sz >= 1024 else f'{sz} B'
-        t.add_row(sec['name'], sec['type'], addr, size_str)
-
-    return Panel(
-        t,
-        title='[bold]ELF Sections[/bold]',
-        border_style='dim white',
-        box=box.ROUNDED,
-        padding=(0, 1),
-    )
-
-
-def _strings_panel(strings: list) -> Panel:
-    CAT_STYLE = {
-        'url':     ('URL',     'blue'),
-        'ip':      ('IP',      'yellow'),
-        'path':    ('Path',    'cyan'),
-        'shell':   ('Shell',   'red'),
-        'env_var': ('Env Var', 'magenta'),
-    }
-    if not strings:
-        body  = Text('  (no interesting strings found)', style='dim italic')
-        count = '0'
-    else:
-        t = Table(
-            box=box.SIMPLE_HEAD,
-            show_header=True,
-            header_style='bold dim',
-            padding=(0, 1),
-            expand=True,
-        )
-        t.add_column('Offset',   style='dim',  no_wrap=True,
-                     min_width=12, justify='right')
-        t.add_column('Category', no_wrap=True, min_width=10)
-        t.add_column('String',   no_wrap=False)
-
-        for item in strings:
-            label, color = CAT_STYLE.get(item['category'], ('Other', 'white'))
-            t.add_row(
-                f'0x{item["offset"]:08x}',
-                Text(label, style=f'bold {color}'),
-                Text(item['string'][:120], style='white'),
-            )
-        body  = t
-        count = str(len(strings))
-
-    return Panel(
-        body,
-        title=f'[bold]Interesting Strings[/bold] ([bold]{count}[/bold])',
-        border_style='dim white',
-        box=box.ROUNDED,
-        padding=(0, 1),
-    )
-
-
-# ── Main entry point ──────────────────────────────────────────────────────────
+# ── entry point ───────────────────────────────────────────────────────────────
 
 def run_inspect(
-    binary:        str,
-    output_json:   bool,
+    binary: str,
+    output_json: bool,
     show_sections: bool,
-    show_strings:  bool,
+    show_strings: bool,
 ) -> None:
-    """Full ELF inspection — called by the 'lure inspect' command."""
+    """
+    Entry point for `lure inspect`.  Validates *binary*, parses its ELF
+    headers, then renders either a rich multi-panel report or a JSON dict.
 
-    filepath = os.path.realpath(binary)
-    path     = Path(filepath)
+    Every validation and parse error calls sys.exit(1) so the CLI exits
+    with a non-zero code (the same contract as `lure run`).
+    """
 
-    if not path.exists():
-        console.print(f'[red]Error:[/red] file not found: {filepath}')
-        return
+    path = os.path.realpath(binary)
 
-    if path.stat().st_size == 0:
-        console.print('[red]Error: file is empty.[/red]')
-        return
+    # ── validation ────────────────────────────────────────────────────────────
 
-    if not is_elf_file(filepath):
-        console.print(f'[red]{NOT_ELF_ERROR}[/red]')
-        return
+    if not Path(path).exists():
+        _err(output_json, f'Error: {binary} \u2014 file not found')
 
-    # ── File metadata (no ELF parsing needed yet) ──────────────────────────────
-    st          = path.stat()
-    size_bytes  = st.st_size
-    md5_hash    = _md5(filepath)
-    sha256_hash = _sha256(filepath)
-    perms       = stat.filemode(st.st_mode)
-    octal       = oct(st.st_mode & 0o777)[2:]
-    modified    = datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d  %H:%M')
+    if os.path.getsize(path) == 0:
+        _err(output_json, f'Error: {binary} \u2014 file is empty')
 
-    # ── Parse ELF (all reads inside the with-block) ────────────────────────────
+    if not is_elf_file(path):
+        _err(output_json, NOT_ELF_ERROR)
+
+    # ── parse ─────────────────────────────────────────────────────────────────
+
     try:
-        with open(filepath, 'rb') as f:
-            elf = ELFFile(f)
-
-            bits     = elf.elfclass
-            arch     = ARCH_MAP.get(elf.header.e_machine, elf.header.e_machine)
-            elf_type = TYPE_MAP.get(elf.header.e_type,    elf.header.e_type)
-            entry    = elf.header.e_entry
-
-            dynamic  = _is_dynamic(elf)
+        with open(path, 'rb') as fh:
+            elf      = ELFFile(fh)
+            arch     = _get_arch(elf)
+            elf_type = elf['e_type']
+            endian   = elf.little_endian
+            security = _get_security(elf)
             libs     = _get_libraries(elf)
-            nx       = _check_nx(elf)
-            pie      = _check_pie(elf)
-            relro    = _check_relro(elf)
-            canary   = _check_canary(elf)
-            stripped = _check_stripped(elf)
-            endian   = 'Little Endian' if elf.little_endian else 'Big Endian'
-            upx      = _check_upx(elf, filepath)
-            sections = _get_sections_data(elf) if show_sections else []
+            sections = _get_sections(elf) if show_sections else []
+    except Exception as exc:
+        _err(output_json, f'Error: failed to parse ELF: {exc}')
 
-    except Exception:
-        console.print(f'[red]{NOT_ELF_ERROR}[/red]')
-        return
+    strings = _get_strings(path) if show_strings else []
+    hashes  = _file_hashes(path)
+    size    = os.path.getsize(path)
 
-    strings = _extract_strings(filepath) if show_strings else []
+    # ── JSON output ───────────────────────────────────────────────────────────
 
-    # ── JSON output ────────────────────────────────────────────────────────────
     if output_json:
-        console.print_json(json.dumps({
-            'file': {
-                'path':        filepath,
-                'name':        path.name,
-                'size_bytes':  size_bytes,
-                'permissions': f'{perms} ({octal})',
-                'modified':    modified,
-                'md5':         md5_hash,
-                'sha256':      sha256_hash,
-            },
+        out: dict = {
+            'binary':     os.path.basename(path),
+            'full_path':  path,
+            'size_bytes': size,
+            'hashes':     hashes,
             'elf': {
-                'bits':    bits,
-                'arch':    arch,
-                'type':    elf_type,
-                'entry':   hex(entry),
-                'endian':  endian,
-                'dynamic': dynamic,
+                'arch':   arch,
+                'type':   elf_type,
+                'endian': 'little' if endian else 'big',
             },
-            'security': {
-                'nx':       nx,
-                'pie':      pie,
-                'relro':    relro,
-                'canary':   canary,
-                'stripped': stripped,
-                'upx':      upx,
-            },
-            'libraries': libs,
-            'sections':  sections,
-            'strings':   strings,
-        }, indent=2))
+            'security':   security,
+            'libraries':  libs,
+        }
+        if show_sections:
+            out['sections'] = sections
+        if show_strings:
+            out['strings'] = strings
+        print(json.dumps(out, indent=2))
         return
 
-    # ── Terminal output ────────────────────────────────────────────────────────
+    # ── rich display ──────────────────────────────────────────────────────────
 
-    console.print(Panel.fit(
-        f'[bold cyan]INSPECT[/bold cyan]  [bold white]{filepath}[/bold white]',
-        border_style='cyan',
-        box=box.ROUNDED,
-    ))
+    # File metadata
+    meta = Table(box=None, show_header=False, padding=(0, 2))
+    meta.add_column('k', style='dim', no_wrap=True)
+    meta.add_column('v')
+    meta.add_row('File',   path)
+    meta.add_row('Size',   _human_size(size))
+    meta.add_row('MD5',    hashes['md5'])
+    meta.add_row('SHA256', hashes['sha256'])
+    console.print(Panel(meta, title='[bold]File[/bold]', border_style='dim'))
 
-    if upx:
-        console.print(Panel(
-            Text.assemble(
-                ('\n  ⚠   UPX PACKED BINARY DETECTED   ⚠\n\n', 'bold red'),
-                ('  Static analysis results will be INCOMPLETE.\n', 'yellow'),
-                ('  Sections, imports, and strings may be hidden.\n', 'yellow'),
-                ('  Unpack first:  ', 'dim'),
-                (f'upx -d {path.name}\n', 'bold white'),
-            ),
-            border_style='red',
-            box=box.HEAVY,
-            padding=(0, 1),
-        ))
+    # Architecture
+    abi = Table(box=None, show_header=False, padding=(0, 2))
+    abi.add_column('k', style='dim', no_wrap=True)
+    abi.add_column('v')
+    abi.add_row('Architecture', arch)
+    abi.add_row('ELF type',     elf_type)
+    abi.add_row('Endianness',   'Little-endian' if endian else 'Big-endian')
+    console.print(Panel(abi, title='[bold]Architecture[/bold]', border_style='dim'))
 
-    # ── Side-by-side panels — 7 rows each ─────────────────────────────────────
-    addr_fmt  = '0x{:016x}' if bits == 64 else '0x{:08x}'
-    entry_str = addr_fmt.format(entry)
+    # Security features
+    def _flag(val: bool, yes: str = 'Enabled', no: str = 'Disabled') -> Text:
+        return (
+            Text(f'\u2714  {yes}', style='green') if val
+            else Text(f'\u2718  {no}', style='red')
+        )
 
-    file_rows = [
-        ('Name',        path.name),
-        ('Path',        str(path.parent)),
-        ('Size',        f'{size_bytes / 1024:.1f} KB  ({size_bytes:,} bytes)'),
-        ('Permissions', Text(f'{perms}  ({octal})', style='green')),
-        ('Modified',    modified),
-        ('MD5',         Text(md5_hash, style='dim')),
-        ('SHA-256',     Text(sha256_hash[:40] + '...', style='dim')),
-    ]
-    elf_rows = [
-        ('Class',        f'ELF{bits}'),
-        ('Architecture', arch),
-        ('Endianness',   endian),
-        ('Type',         elf_type),
-        ('Entry Point',  Text(entry_str, style='bold green')),
-        ('Linking',
-         Text('Dynamic', style='cyan') if dynamic else Text('Static', style='yellow')),
-        ('Stripped',
-         _warn_txt('Yes (debug symbols absent)') if stripped
-         else _ok('No   (symbols present)')),
-    ]
+    relro_display = {
+        'full':    Text('\u2714  Full',    style='green'),
+        'partial': Text('~  Partial',     style='yellow'),
+        'none':    Text('\u2718  None',    style='red'),
+    }.get(security['relro'], Text(security['relro']))
 
-    side = Table(
-        box=None, show_header=False, show_edge=False,
-        padding=0, expand=True,
-    )
-    side.add_column(ratio=1)
-    side.add_column(ratio=1)
-    side.add_row(
-        _kv_panel(file_rows, 'File'),
-        _kv_panel(elf_rows,  'ELF Header'),
-    )
-    console.print(side)
+    sec_tbl = Table(box=box.SIMPLE, show_header=True, header_style='bold dim')
+    sec_tbl.add_column('Mitigation',   style='bold', no_wrap=True)
+    sec_tbl.add_column('Status',       no_wrap=True)
+    sec_tbl.add_row('NX',           _flag(security['nx']))
+    sec_tbl.add_row('PIE',          _flag(security['pie']))
+    sec_tbl.add_row('Stack canary', _flag(security['canary']))
+    sec_tbl.add_row('RELRO',        relro_display)
+    console.print(Panel(sec_tbl,
+                        title='[bold]Security Features[/bold]',
+                        border_style='dim'))
 
-    console.print(_security_panel(nx, pie, relro, canary))
-    console.print(_libraries_panel(libs))
-
-    if show_sections:
-        console.print(_sections_panel(sections, bits))
-    if show_strings:
-        console.print(_strings_panel(strings))
-
-    mitigations = sum([nx, pie, canary, relro != 'none'])
-    if mitigations == 4:
-        rating = Text('● Hardened',   style='bold green')
-    elif mitigations >= 2:
-        rating = Text('◑ Moderate',   style='bold yellow')
+    # Linked libraries
+    if libs:
+        lib_tbl = Table(box=box.SIMPLE, show_header=False)
+        lib_tbl.add_column('Library', style='cyan')
+        for lib in libs:
+            lib_tbl.add_row(lib)
+        console.print(Panel(lib_tbl,
+                            title='[bold]Linked Libraries[/bold]',
+                            border_style='dim'))
     else:
-        rating = Text('○ Vulnerable', style='bold red')
+        console.print(Panel('[dim]None \u2014 statically linked[/dim]',
+                            title='[bold]Linked Libraries[/bold]',
+                            border_style='dim'))
 
-    console.print(Panel(
-        Text.assemble(
-            ('Security Rating  ', 'dim'),
-            rating,
-            (f'   ({mitigations}/4 mitigations active)', 'dim'),
-        ),
-        border_style='dim',
-        box=box.ROUNDED,
-        padding=(0, 1),
-    ))
-    console.print()
+    # Section headers (--sections)
+    # All values are str (guaranteed by _get_sections), so no crash on add_row.
+    if show_sections and sections:
+        s_tbl = Table(box=box.SIMPLE, show_header=True, header_style='bold dim')
+        s_tbl.add_column('Name')
+        s_tbl.add_column('Type')
+        s_tbl.add_column('Offset')
+        s_tbl.add_column('Size', justify='right')
+        for sec in sections:
+            s_tbl.add_row(
+                str(sec['name']),
+                str(sec['type']),
+                str(sec['offset']),
+                str(sec['size']),
+            )
+        console.print(Panel(s_tbl,
+                            title='[bold]Section Headers[/bold]',
+                            border_style='dim'))
+
+    # Strings (--strings)
+    if show_strings and strings:
+        shown = strings[:50]
+        str_tbl = Table(box=box.SIMPLE, show_header=False)
+        str_tbl.add_column('String', style='dim')
+        for s in shown:
+            str_tbl.add_row(s)
+        title = (
+            f'[bold]Strings[/bold] '
+            f'[dim](top {len(shown)} of {len(strings)})[/dim]'
+        )
+        console.print(Panel(str_tbl, title=title, border_style='dim'))
+
+
+# ── internal error helper ─────────────────────────────────────────────────────
+
+def _err(output_json: bool, msg: str) -> None:
+    """Print *msg* in the appropriate format and exit with code 1.
+    Annotated NoReturn-style: callers need not check the return value."""
+    if output_json:
+        print(json.dumps({'error': msg}))
+    else:
+        console.print(f'[red]{msg}[/red]')
+    sys.exit(1)

@@ -1648,21 +1648,25 @@ def run_binary(binary, timeout, binary_args, allow_net, trace_out, save=False):
         if os.path.exists(cwd_candidate):
             console.print(f'[red]Error:[/red] file not found: {binary}')
             console.print(f"[dim]Tip:[/dim] did you mean './{binary}'?")
-            return
+            sys.exit(1)
 
     binary_path = os.path.realpath(binary)
     if not Path(binary_path).exists():
         console.print(f'[red]Error:[/red] {binary_path} — file not found')
-        return
+        sys.exit(1)
 
     if not os.access(binary_path, os.X_OK):
         console.print(f'[red]Error:[/red] file is not executable: {binary_path}')
         console.print(f'[dim]Tip:[/dim] run chmod +x {binary_path} to make it executable')
-        return
+        sys.exit(1)
+
+    if os.path.getsize(binary_path) == 0:
+        console.print(f'[red]Error:[/red] {binary_path} — file is empty')
+        sys.exit(1)
 
     if not is_elf_file(binary_path):
         console.print(f'[red]{NOT_ELF_ERROR}[/red]')
-        return
+        sys.exit(1)
 
     if not shutil.which('strace'):
         hint = _strace_install_hint()

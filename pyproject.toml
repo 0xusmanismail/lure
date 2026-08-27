@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "lure-analyze"
-version         = "0.5.1"
+version         = "0.6.0"
 description     = "Local Linux binary analysis tool for security researchers and CTF players"
 readme          = "README.md"
 requires-python = ">=3.9"
@@ -43,6 +43,11 @@ dependencies    = [
     "pyelftools>=0.30",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+]
+
 [project.urls]
 Homepage   = "https://github.com/0xusmanismail/lure"
 Repository = "https://github.com/0xusmanismail/lure"
@@ -54,3 +59,10 @@ lure = "lure.main:cli"
 [tool.setuptools.packages.find]
 where   = ["."]
 include = ["lure*"]
+
+[tool.pytest.ini_options]
+# Collect everything under tests/.
+testpaths = ["tests"]
+# Print a short summary of all failures/errors after the run.
+# -v is left to the caller; -ra shows all non-passing outcomes.
+addopts   = "-ra"

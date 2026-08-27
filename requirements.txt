@@ -1,4 +1,8 @@
 # FILE: requirements.txt
+# Runtime dependencies (mirrors pyproject.toml [project.dependencies]).
 click>=8.1
 rich>=13.7
 pyelftools>=0.30
+
+# Development / testing.
+pytest>=7.4

@@ -95,7 +95,6 @@ and a CLEAN / SUSPICIOUS / DANGEROUS verdict.
 
 ![Lure run part 1](assets/run-1.png)
 ![Lure run part 2](assets/run-2.png)
-![Lure run part 3](assets/run-3.png)
 
 ### Save the report
 
