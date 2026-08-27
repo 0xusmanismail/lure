@@ -4,6 +4,8 @@
 
 **lure** is a local Linux ELF analysis and sandboxing tool for security researchers, reverse engineers, and CTF players.
 
+![Lure demo](assets/demo.gif)
+
 It provides three complementary workflows:
 
 - **Static analysis** with `lure inspect` — inspect an ELF without executing it.
@@ -13,6 +15,19 @@ It provides three complementary workflows:
 Everything is processed locally. No sample or report is uploaded to a cloud service.
 
 > **Alpha software:** lure is still under active development. Test it in an environment appropriate for security research and do not treat this sandbox as a replacement for a dedicated malware-analysis VM.
+
+![Lure dangerous verdict](assets/dangerous-3.png)
+
+## What it does
+
+Lure combines static ELF inspection with behavioral execution analysis. It can show what a binary accesses, what network connections it attempts, what processes it spawns, and how the run is classified as **CLEAN**, **SUSPICIOUS**, or **DANGEROUS**.
+
+## Why
+
+- **Privacy** — samples and reports stay on your machine.
+- **Readable** — structured reports instead of raw `strace` noise.
+- **Simple workflow** — inspect, run, save, and compare from one CLI.
+- **Free** — MIT licensed and built around standard Linux tooling.
 
 ## Features
 
@@ -34,6 +49,12 @@ Everything is processed locally. No sample or report is uploaded to a cloud serv
 
 The inspected file is not executed.
 
+```bash
+lure inspect /bin/ls
+```
+
+![inspect](assets/inspect-1.png)
+
 ### Sandboxed execution
 
 `lure run` combines:
@@ -53,17 +74,55 @@ The inspected file is not executed.
 
 Network access is blocked by default.
 
-The seccomp policy uses an allow-list, an explicit deny-list, a default `EPERM` action, an architecture check, and a `socket()` family check. The exact syscall policy is an implementation detail and may change between releases.
+```bash
+lure run ./suspicious_binary
+```
 
-### Report comparison
+![run live feed](assets/run-1.png)
 
-`lure diff` compares two JSON reports and shows:
+![run report](assets/run-2.png)
+
+### Detect suspicious behavior
+
+```bash
+lure run ./demo_dangerous
+```
+
+A run can produce a **DANGEROUS** verdict when its configured behavioral triggers are matched, with the triggering evidence included in the report.
+
+![Lure catching dangerous behavior](assets/dangerous-3.png)
+
+### Compare reports
+
+```bash
+lure run --save /bin/ls
+lure run --save /bin/echo
+lure diff report1.json report2.json
+```
+
+`lure diff` shows:
 
 - New files
 - Removed files
 - New network connections
 - Verdict changes
 - Syscall-count changes
+
+![diff output](assets/diff-1.png)
+
+### Save a report
+
+```bash
+lure run --save ./binary
+```
+
+Saved reports are written under:
+
+```text
+~/.lure/reports/
+```
+
+Each saved run produces a human-readable `.txt` transcript and a structured `.json` report.
 
 ## Installation
 
@@ -130,7 +189,7 @@ sudo apt install strace util-linux
 sudo dnf install strace util-linux
 ```
 
-## Quick start
+## Usage
 
 ### Inspect an ELF
 
@@ -200,15 +259,7 @@ Save the full report:
 lure run --save ./sample
 ```
 
-Saved reports are written under:
-
-```text
-~/.lure/reports/
-```
-
-A saved run produces a human-readable `.txt` transcript and a structured `.json` report.
-
-### Compare reports
+### Compare two runs
 
 ```bash
 lure diff report1.json report2.json
@@ -274,6 +325,36 @@ In particular, the runner can fall back when:
 
 The reported isolation mode should be checked for security-sensitive analysis. When stronger containment is required, use an external isolation boundary such as a dedicated VM.
 
+## Reports
+
+A saved JSON report contains structured data including:
+
+```text
+binary
+full_path
+timestamp
+runtime_seconds
+exit_code
+isolation
+resource_limits
+verdict
+verdict_triggers
+files_accessed
+network_attempts
+processes_spawned
+syscall_total
+```
+
+The behavioral verdict is one of:
+
+```text
+CLEAN
+SUSPICIOUS
+DANGEROUS
+```
+
+The JSON report is intended to make runs easy to archive, inspect, and compare.
+
 ## CLI reference
 
 ### `lure`
@@ -318,36 +399,6 @@ Options:
 lure diff REPORT1 REPORT2
 ```
 
-## Reports
-
-A saved JSON report contains structured data including:
-
-```text
-binary
-full_path
-timestamp
-runtime_seconds
-exit_code
-isolation
-resource_limits
-verdict
-verdict_triggers
-files_accessed
-network_attempts
-processes_spawned
-syscall_total
-```
-
-The behavioral verdict is one of:
-
-```text
-CLEAN
-SUSPICIOUS
-DANGEROUS
-```
-
-The JSON report is intended to make runs easy to archive, inspect, and compare.
-
 ## Error handling
 
 `lure inspect` rejects invalid or non-ELF input and exits non-zero on validation failures.
@@ -355,6 +406,23 @@ The JSON report is intended to make runs easy to archive, inspect, and compare.
 `lure run` validates that the target exists, is executable, is non-empty, and is an ELF before attempting execution. It also requires `strace`.
 
 The test suite covers inspection, execution, diffing, flags, timeouts, report schemas, and edge cases.
+
+## Status
+
+**Working in v0.6.0:**
+
+- ELF inspection with security mitigation detection
+- UPX/packer-related inspection support where implemented
+- Sandboxed execution via Linux namespaces + `strace`
+- Mount + PID namespace isolation with a minimal sandbox filesystem
+- seccomp-bpf filtering
+- Live event reporting during execution
+- CLEAN / SUSPICIOUS / DANGEROUS verdicts
+- TXT + JSON report saving
+- Report comparison via `lure diff`
+- Non-ELF and invalid-input handling
+- cgroups v2 resource limits when available
+- PyPI package: `lure-analyze`
 
 ## Development
 
