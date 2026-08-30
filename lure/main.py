@@ -31,7 +31,7 @@ class OrderedGroup(click.Group):
 
 @click.group(cls=OrderedGroup, context_settings=CONTEXT_SETTINGS)
 @click.version_option(
-    version='0.7.0', prog_name='lure', help='Show version and exit.'
+    version="0.7.1", prog_name='lure', help='Show version and exit.'
 )
 def cli():
     """

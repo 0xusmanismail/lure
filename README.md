@@ -4,7 +4,7 @@
 
 **lure** is a local Linux ELF analysis and sandboxing tool for security researchers, reverse engineers, and CTF players.  Version **0.7.0** adds ARM64 binary support via QEMU user-mode emulation.
 
-![Lure demo](assets/demo.gif)
+![Lure demo](https://raw.githubusercontent.com/0xusmanismail/lure/main/assets/demo.gif)
 
 It provides three complementary workflows:
 
@@ -16,7 +16,7 @@ Everything is processed locally. No sample or report is uploaded to a cloud serv
 
 > **Alpha software:** lure is still under active development. Test it in an environment appropriate for security research and do not treat this sandbox as a replacement for a dedicated malware-analysis VM.
 
-![Lure dangerous verdict](assets/dangerous-3.png)
+![Lure dangerous verdict](https://raw.githubusercontent.com/0xusmanismail/lure/main/assets/dangerous-3.png)
 
 ## What it does
 
@@ -55,7 +55,7 @@ lure inspect /bin/ls
 lure inspect ./arm64_binary   # ARM64 ELF — no QEMU needed for inspection
 ```
 
-![inspect](assets/inspect-1.png)
+![inspect](https://raw.githubusercontent.com/0xusmanismail/lure/main/assets/inspect-1.png)
 
 ### Sandboxed execution
 
