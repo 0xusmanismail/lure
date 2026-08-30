@@ -9,6 +9,9 @@ binary_echo        str  — always '/usr/bin/echo'
 demo_dangerous     str  — path to a compiled binary that reads /etc/passwd
                           and attempts a TCP connect to 93.184.216.34:443;
                           compiled once per session, cached at a fixed temp path
+arm64_elf          str  — path to a minimal ARM64 ELF binary (exit(0));
+                          built from raw bytes (no cross-compiler required),
+                          cached at a fixed temp path across sessions
 saved_report       str  — path to the .json written by `lure run --save /usr/bin/ls`;
                           both .json and .txt are deleted after the test
 two_saved_reports  tuple[str,str]  — (ls_json, echo_json) from --save runs;
@@ -17,6 +20,7 @@ two_saved_reports  tuple[str,str]  — (ls_json, echo_json) from --save runs;
 
 import glob
 import os
+import struct
 import subprocess
 import textwrap
 from pathlib import Path
@@ -31,6 +35,11 @@ REPORTS_DIR = os.path.expanduser('~/.lure/reports')
 # sessions without re-running gcc every `pytest` invocation.
 _DEMO_BIN_PATH = Path('/tmp/lure_test_demo_dangerous')
 _DEMO_SRC_PATH = Path('/tmp/lure_test_demo_dangerous.c')
+
+# Fixed temp path for the ARM64 ELF fixture. Built once from raw bytes —
+# no cross-compiler needed. The binary is a minimal ELF that exits with
+# code 0 via the ARM64 exit syscall (movz x8,#93 / movz x0,#0 / svc #0).
+_ARM64_ELF_PATH = Path('/tmp/lure_test_arm64_exit')
 
 _DEMO_DANGEROUS_SRC = textwrap.dedent("""\
     #include <stdio.h>
@@ -100,6 +109,100 @@ def demo_dangerous():
                 f'demo_dangerous.c failed to compile:\n{result.stderr}'
             )
     return str(_DEMO_BIN_PATH)
+
+
+# ── arm64_elf ─────────────────────────────────────────────────────────────────
+
+@pytest.fixture(scope='session')
+def arm64_elf():
+    """
+    Build a minimal ARM64 ELF binary (132 bytes) using Python's struct
+    module only — no gcc or cross-compiler required.
+
+    The binary is a complete, valid ELF64 executable for AArch64:
+      - ELF header (64 bytes): e_machine=183 (EM_AARCH64), e_type=ET_EXEC
+      - PT_LOAD program header (56 bytes): load at 0x400000, PF_R|PF_X
+      - ARM64 machine code (12 bytes): exit(0) via the Linux syscall interface
+          movz x8, #93    ; syscall number: exit (AArch64 Linux)
+          movz x0, #0     ; exit code: 0
+          svc  #0         ; invoke the syscall
+
+    Instruction encoding (little-endian):
+      0xa8 0x0b 0x80 0xd2  — movz x8, #93
+      0x00 0x00 0x80 0xd2  — movz x0, #0
+      0x01 0x00 0x00 0xd4  — svc  #0
+
+    Uses a fixed path (/tmp/lure_test_arm64_exit) so the binary is created
+    once and reused across test sessions.
+    """
+    if not _ARM64_ELF_PATH.exists():
+        # ARM64 exit(0) machine code
+        code = bytes([
+            0xa8, 0x0b, 0x80, 0xd2,   # movz x8, #93  (exit syscall number)
+            0x00, 0x00, 0x80, 0xd2,   # movz x0, #0   (exit code)
+            0x01, 0x00, 0x00, 0xd4,   # svc  #0       (invoke syscall)
+        ])
+
+        # ELF64 layout:
+        #   offset 0x00 (64 bytes): ELF header
+        #   offset 0x40 (56 bytes): PT_LOAD program header
+        #   offset 0x78 (12 bytes): ARM64 code
+        LOAD_ADDR   = 0x400000
+        EHDR_SIZE   = 64
+        PHDR_SIZE   = 56
+        CODE_OFFSET = EHDR_SIZE + PHDR_SIZE   # 0x78
+        ENTRY_ADDR  = LOAD_ADDR + CODE_OFFSET  # entry point
+        total_size  = CODE_OFFSET + len(code)  # 132 bytes
+
+        # ELF identification bytes (e_ident, 16 bytes)
+        e_ident = bytes([
+            0x7f, 0x45, 0x4c, 0x46,   # EI_MAG: \x7fELF
+            0x02,                      # EI_CLASS:   ELFCLASS64
+            0x01,                      # EI_DATA:    ELFDATA2LSB (little-endian)
+            0x01,                      # EI_VERSION: EV_CURRENT
+            0x00,                      # EI_OSABI:   ELFOSABI_NONE
+            0x00, 0x00, 0x00, 0x00,   # EI_ABIVERSION + padding
+            0x00, 0x00, 0x00, 0x00,   # padding
+        ])
+
+        # ELF64 header fields (48 bytes): '<HHIQQQIHHHHHH'
+        ehdr = struct.pack(
+            '<HHIQQQIHHHHHH',
+            2,             # e_type:      ET_EXEC
+            183,           # e_machine:   EM_AARCH64 (= 0xB7)
+            1,             # e_version:   EV_CURRENT
+            ENTRY_ADDR,    # e_entry:     virtual address of entry point
+            EHDR_SIZE,     # e_phoff:     program header table offset
+            0,             # e_shoff:     no section header table
+            0,             # e_flags:     no processor-specific flags
+            EHDR_SIZE,     # e_ehsize:    ELF header size
+            PHDR_SIZE,     # e_phentsize: size of one program header entry
+            1,             # e_phnum:     one program header (PT_LOAD)
+            64,            # e_shentsize: section header entry size (unused)
+            0,             # e_shnum:     no section headers
+            0,             # e_shstrndx:  no section name string table
+        )
+
+        # ELF64 program header (56 bytes): '<IIQQQQQQ'
+        phdr = struct.pack(
+            '<IIQQQQQQ',
+            1,             # p_type:   PT_LOAD
+            5,             # p_flags:  PF_R | PF_X (read + execute)
+            0,             # p_offset: load from start of file
+            LOAD_ADDR,     # p_vaddr:  virtual load address
+            LOAD_ADDR,     # p_paddr:  physical address (same as virtual)
+            total_size,    # p_filesz: bytes to map from file
+            total_size,    # p_memsz:  bytes to reserve in memory
+            0x1000,        # p_align:  page alignment (4 KiB)
+        )
+
+        data = e_ident + ehdr + phdr + code
+        assert len(data) == 132, f'unexpected ARM64 ELF size: {len(data)}'
+
+        _ARM64_ELF_PATH.write_bytes(data)
+        _ARM64_ELF_PATH.chmod(0o755)
+
+    return str(_ARM64_ELF_PATH)
 
 
 # ── report-save helpers ───────────────────────────────────────────────────────

@@ -197,5 +197,5 @@ class TestVersionFlag:
         )
         assert result.returncode == 0
         output = result.stdout + result.stderr
-        # Version is defined in lure/__init__.py as "0.6.0".
-        assert '0.6.0' in output
+        # Version is defined in lure/__init__.py as "0.7.0".
+        assert '0.7.0' in output

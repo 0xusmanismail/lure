@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "lure-analyze"
-version         = "0.6.0"
+version         = "0.7.0"
 description     = "Local Linux binary analysis tool for security researchers and CTF players"
 readme          = "README.md"
 requires-python = ">=3.9"
@@ -25,6 +25,8 @@ keywords = [
     "elf",
     "ctf",
     "reverse-engineering",
+    "arm64",
+    "qemu",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

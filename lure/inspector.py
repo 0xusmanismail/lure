@@ -6,6 +6,7 @@ Public interface
 ----------------
 NOT_ELF_ERROR           str  — standard error text for non-ELF inputs
 is_elf_file(path)       bool — True iff the file starts with the ELF magic bytes
+get_binary_arch(path)   str  — return the arch string for an ELF binary
 run_inspect(...)        None — entry point called by `lure inspect`
 
 All validation errors call sys.exit(1) so `lure inspect` exits non-zero
@@ -182,6 +183,29 @@ def _get_strings(path: str, min_len: int = 6, cap: int = 200) -> list:
                             break
                 cur = []
     return results
+
+
+# ── public arch helper ────────────────────────────────────────────────────────
+
+def get_binary_arch(path: str) -> str:
+    """Return the architecture string for the ELF binary at *path*.
+
+    Uses the same arch mapping as run_inspect() / _get_arch() — the single
+    source of truth for architecture names across lure.
+
+    Returns 'unknown' on any error (file unreadable, not an ELF, parse
+    failure, etc.) so callers never need to catch exceptions.
+
+    Examples:
+        get_binary_arch('/usr/bin/ls')          -> 'x86-64'
+        get_binary_arch('/tmp/arm64_binary')    -> 'ARM64'
+        get_binary_arch('/etc/passwd')          -> 'unknown'
+    """
+    try:
+        with open(path, 'rb') as fh:
+            return _get_arch(ELFFile(fh))
+    except Exception:
+        return 'unknown'
 
 
 # ── entry point ───────────────────────────────────────────────────────────────

@@ -2,7 +2,7 @@
 
 > Local Linux binary analysis. Zero cloud. Zero root. Zero cost.
 
-**lure** is a local Linux ELF analysis and sandboxing tool for security researchers, reverse engineers, and CTF players.
+**lure** is a local Linux ELF analysis and sandboxing tool for security researchers, reverse engineers, and CTF players.  Version **0.7.0** adds ARM64 binary support via QEMU user-mode emulation.
 
 ![Lure demo](assets/demo.gif)
 
@@ -28,6 +28,7 @@ Lure combines static ELF inspection with behavioral execution analysis. It can s
 - **Readable** — structured reports instead of raw `strace` noise.
 - **Simple workflow** — inspect, run, save, and compare from one CLI.
 - **Free** — MIT licensed and built around standard Linux tooling.
+- **Multi-architecture** — x86-64 native + ARM64 via QEMU user-mode emulation.
 
 ## Features
 
@@ -35,7 +36,7 @@ Lure combines static ELF inspection with behavioral execution analysis. It can s
 
 `lure inspect` reports:
 
-- ELF architecture and type
+- ELF architecture and type (x86-64, ARM64, and more)
 - Endianness
 - File size
 - MD5 and SHA-256 hashes
@@ -51,6 +52,7 @@ The inspected file is not executed.
 
 ```bash
 lure inspect /bin/ls
+lure inspect ./arm64_binary   # ARM64 ELF — no QEMU needed for inspection
 ```
 
 ![inspect](assets/inspect-1.png)
@@ -71,436 +73,87 @@ lure inspect /bin/ls
 - Optional raw `strace` output
 - Optional TXT + JSON reports
 - Best-effort cgroups v2 resource limits when available
+- **ARM64 binary emulation via `qemu-aarch64`** (v0.7.0+)
 
 Network access is blocked by default.
 
 ```bash
 lure run ./suspicious_binary
+lure run ./arm64_binary          # ARM64: qemu-aarch64 wraps the binary automatically
 ```
 
-![run live feed](assets/run-1.png)
+When an ARM64 binary is detected, lure:
+1. Checks that `qemu-aarch64` is on PATH (exits with a clear install hint if not).
+2. Prepends `qemu-aarch64` to the execution command — strace traces the entire QEMU chain.
+3. Shows **Architecture: ARM64 (QEMU emulated)** in the Execution Summary panel.
 
-![run report](assets/run-2.png)
+### Report comparison
 
-### Detect suspicious behavior
+`lure diff` compares two saved `.json` reports:
 
 ```bash
-lure run ./demo_dangerous
+lure run --save ./binary_v1
+lure run --save ./binary_v2
+lure diff ~/.lure/reports/binary_v1_*.json ~/.lure/reports/binary_v2_*.json
 ```
-
-A run can produce a **DANGEROUS** verdict when its configured behavioral triggers are matched, with the triggering evidence included in the report.
-
-![Lure catching dangerous behavior](assets/dangerous-3.png)
-
-### Compare reports
-
-```bash
-lure run --save /bin/ls
-lure run --save /bin/echo
-lure diff report1.json report2.json
-```
-
-`lure diff` shows:
-
-- New files
-- Removed files
-- New network connections
-- Verdict changes
-- Syscall-count changes
-
-![diff output](assets/diff-1.png)
-
-### Save a report
-
-```bash
-lure run --save ./binary
-```
-
-Saved reports are written under:
-
-```text
-~/.lure/reports/
-```
-
-Each saved run produces a human-readable `.txt` transcript and a structured `.json` report.
 
 ## Installation
 
 ### From PyPI
 
-The package name on PyPI is **`lure-analyze`**, while the installed command is **`lure`**.
-
 ```bash
-python -m pip install lure-analyze
+pip install lure-analyze
 ```
 
-Then verify:
+### System dependencies (required)
+
+| Tool | Package | Purpose |
+|------|---------|---------|
+| `strace` | `sudo pacman -S strace` | syscall tracing |
+| `unshare` | part of `util-linux` (pre-installed) | namespace isolation |
+| `gcc` / `cc` | `sudo pacman -S gcc` | compile seccomp wrapper at runtime |
+
+### System dependencies (optional)
+
+| Tool | Package | Purpose |
+|------|---------|---------|
+| `qemu-aarch64` | `sudo pacman -S qemu-user` | ARM64 binary emulation |
+
+Install `qemu-user` to analyse ARM64 ELF binaries with `lure run`.  Static inspection with `lure inspect` works for ARM64 ELFs without any additional tools.
+
+### cgroups v2 resource limits (optional)
+
+To enable memory and PID limits, delegate a cgroup subtree to your user:
 
 ```bash
-lure --version
-```
-
-For the `v0.6.0` release:
-
-```text
-lure, version 0.6.0
-```
-
-### From source
-
-```bash
-git clone https://github.com/0xusmanismail/lure.git
-cd lure
-python -m pip install -e .
-```
-
-If your Linux distribution enforces PEP 668 for the system Python, use an appropriate virtual environment or your distribution's recommended packaging workflow rather than forcing installation into the system interpreter.
-
-### Development dependencies
-
-```bash
-python -m pip install -e ".[dev]"
-```
-
-## System requirements
-
-- Linux
-- Python 3.9+
-- `strace`
-- `unshare` (provided by `util-linux` on common Linux distributions)
-
-Install the required system tools with your distribution's package manager.
-
-### Arch Linux
-
-```bash
-sudo pacman -S strace util-linux
-```
-
-### Debian / Ubuntu / Kali
-
-```bash
-sudo apt install strace util-linux
-```
-
-### Fedora
-
-```bash
-sudo dnf install strace util-linux
+sudo mkdir -p /sys/fs/cgroup/lure
+sudo chown "$USER" /sys/fs/cgroup/lure
 ```
 
 ## Usage
 
-### Inspect an ELF
-
-```bash
-lure inspect /bin/ls
 ```
-
-JSON output:
-
-```bash
-lure inspect --json /bin/ls
-```
-
-Include section headers:
-
-```bash
-lure inspect --sections /bin/ls
-```
-
-Extract printable strings:
-
-```bash
-lure inspect --strings /bin/ls
-```
-
-Combine options:
-
-```bash
-lure inspect --json --sections --strings /bin/ls
-```
-
-### Run an ELF
-
-```bash
-lure run /bin/ls
-```
-
-Set a timeout:
-
-```bash
-lure run --timeout 10 ./sample
-```
-
-Pass arguments to the guest:
-
-```bash
-lure run --args '--help' ./sample
-```
-
-Allow outbound network access:
-
-```bash
-lure run --allow-net ./sample
-```
-
-> Network access is disabled by default. Only enable it when you understand the risk and your analysis environment permits it.
-
-Save the raw `strace` log:
-
-```bash
-lure run --out trace.log ./sample
-```
-
-Save the full report:
-
-```bash
-lure run --save ./sample
-```
-
-### Compare two runs
-
-```bash
-lure diff report1.json report2.json
-```
-
-For example:
-
-```bash
-lure diff ~/.lure/reports/run-a.json ~/.lure/reports/run-b.json
-```
-
-## Isolation model
-
-The execution path is designed as **layered isolation**, not as a single security boundary.
-
-### Normal path
-
-The runner uses:
-
-1. A user namespace
-2. A network namespace
-3. A mount namespace
-4. A PID namespace
-5. A minimal sandbox filesystem
-6. `strace` for observation
-7. A seccomp-bpf filter for the guest process
-8. Best-effort cgroups v2 resource limits when the host permits them
-
-The guest is not given host root privileges. The sandbox uses read-only filesystem mounts where appropriate.
-
-### Seccomp
-
-The seccomp policy is deliberately separate from `strace`: the filter is installed for the guest wrapper and guest binary so tracing can continue.
-
-The policy includes:
-
-- an allow-list
-- an explicit deny-list that produces `SIGSYS`
-- a default `EPERM` action
-- an architecture check
-- a `socket()` family check
-
-The current implementation contains 178 allowed syscall numbers plus a separate explicit deny-list. This is an implementation detail and may change between releases.
-
-### Resource limits
-
-When cgroups v2 are available and delegated for use, lure attempts to apply:
-
-- **512 MiB** memory maximum
-- **64** processes maximum
-- swap disabled
-
-These limits are best-effort. If cgroups are unavailable, the run continues and the report records that resource limits were not active.
-
-### Fallback behavior
-
-If parts of the isolation stack are unavailable, lure can fall back to a weaker configuration rather than claiming full isolation.
-
-In particular, the runner can fall back when:
-
-- mount-namespace setup is unavailable, or
-- the seccomp wrapper/filter cannot be used.
-
-The reported isolation mode should be checked for security-sensitive analysis. When stronger containment is required, use an external isolation boundary such as a dedicated VM.
-
-## Reports
-
-A saved JSON report contains structured data including:
-
-```text
-binary
-full_path
-timestamp
-runtime_seconds
-exit_code
-isolation
-resource_limits
-verdict
-verdict_triggers
-files_accessed
-network_attempts
-processes_spawned
-syscall_total
-```
-
-The behavioral verdict is one of:
-
-```text
-CLEAN
-SUSPICIOUS
-DANGEROUS
-```
-
-The JSON report is intended to make runs easy to archive, inspect, and compare.
-
-## CLI reference
-
-### `lure`
-
-```text
-lure [OPTIONS] COMMAND [ARGS]...
-```
-
-### `lure inspect`
-
-```text
-lure inspect [OPTIONS] BINARY
-```
-
-Options:
-
-```text
---json
---sections
---strings
-```
-
-### `lure run`
-
-```text
-lure run [OPTIONS] BINARY
-```
-
-Options:
-
-```text
--t, --timeout SECS
---args 'ARG ...'
---allow-net
---out FILE
---save
-```
-
-### `lure diff`
-
-```text
+lure inspect BINARY [--json] [--sections] [--strings]
+lure run BINARY [--timeout SECS] [--args 'ARG ...'] [--allow-net] [--out FILE] [--save]
 lure diff REPORT1 REPORT2
 ```
 
-## Error handling
+## Changelog
 
-`lure inspect` rejects invalid or non-ELF input and exits non-zero on validation failures.
+### v0.7.0
+- **ARM64 binary support** via `qemu-aarch64` user-mode emulation
+- `lure inspect` correctly displays `ARM64` for AArch64 ELFs
+- `lure run` auto-detects ARM64 ELFs and wraps execution with `qemu-aarch64`
+- Execution Summary shows `Architecture: ARM64 (QEMU emulated)` for ARM64 runs
+- Clean error and install hint when `qemu-aarch64` is missing
+- 4 new tests covering ARM64 inspect (display + JSON) and run (missing-qemu + QEMU success)
 
-`lure run` validates that the target exists, is executable, is non-empty, and is an ELF before attempting execution. It also requires `strace`.
-
-The test suite covers inspection, execution, diffing, flags, timeouts, report schemas, and edge cases.
-
-## Status
-
-**Working in v0.6.0:**
-
-- ELF inspection with security mitigation detection
-- UPX/packer-related inspection support where implemented
-- Sandboxed execution via Linux namespaces + `strace`
-- Mount + PID namespace isolation with a minimal sandbox filesystem
-- seccomp-bpf filtering
-- Live event reporting during execution
-- CLEAN / SUSPICIOUS / DANGEROUS verdicts
-- TXT + JSON report saving
-- Report comparison via `lure diff`
-- Non-ELF and invalid-input handling
-- cgroups v2 resource limits when available
-- PyPI package: `lure-analyze`
-
-## Development
-
-Install development dependencies:
-
-```bash
-python -m pip install -e ".[dev]"
-```
-
-Run the test suite:
-
-```bash
-python -m pytest
-```
-
-The project uses pytest for automated tests.
-
-When changing sandbox behavior, update the tests and documentation together. Security-sensitive changes should be tested on the Linux environments they are intended to support.
-
-## Project layout
-
-```text
-lure/
-├── lure/
-│   ├── main.py
-│   ├── inspector.py
-│   ├── runner.py
-│   └── diff.py
-├── tests/
-│   ├── test_inspect.py
-│   ├── test_run.py
-│   ├── test_diff.py
-│   └── test_edge_cases.py
-├── assets/
-├── pyproject.toml
-├── requirements.txt
-├── CONTRIBUTING.md
-├── LICENSE
-└── README.md
-```
-
-## Versioning
-
-The `v0.6.0` release corresponds to package version `0.6.0`.
-
-The Python package is published as:
-
-```text
-lure-analyze
-```
-
-The CLI command is:
-
-```text
-lure
-```
-
-## Limitations
-
-- Linux-only.
-- The sandbox depends on kernel and namespace capabilities available on the host.
-- Isolation can fall back when required kernel features or the seccomp wrapper are unavailable.
-- Resource limits depend on cgroups v2 availability and delegation.
-- `lure inspect` currently targets ELF files.
-- The project is Alpha software and should not be considered a complete malware-analysis environment.
-
-## Contributing
-
-Issues and pull requests are welcome.
-
-For development setup and contribution guidelines, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+### v0.6.0
+- cgroups v2 resource limits (512 MB memory, 64 PIDs max)
+- seccomp-bpf allow-list via compiled C lure-wrapper
+- Full mount + PID namespace isolation with minimal chroot
+- `lure diff` report comparison
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
-
-## Links
-
-- [Repository](https://github.com/0xusmanismail/lure)
-- [Issues](https://github.com/0xusmanismail/lure/issues)
-- [PyPI](https://pypi.org/project/lure-analyze/)
+MIT — see [LICENSE](LICENSE).
