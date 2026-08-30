@@ -2,7 +2,7 @@
 
 > Local Linux binary analysis. Zero cloud. Zero root. Zero cost.
 
-**lure** is a local Linux ELF analysis and sandboxing tool for security researchers, reverse engineers, and CTF players.  Version **0.7.0** adds ARM64 binary support via QEMU user-mode emulation.
+**lure** is a local Linux ELF analysis and sandboxing tool for security researchers, reverse engineers, and CTF players.  Version **0.7.1** adds ARM64 binary support via QEMU user-mode emulation.
 
 ![Lure demo](https://raw.githubusercontent.com/0xusmanismail/lure/main/assets/demo.gif)
 
@@ -73,7 +73,7 @@ lure inspect ./arm64_binary   # ARM64 ELF — no QEMU needed for inspection
 - Optional raw `strace` output
 - Optional TXT + JSON reports
 - Best-effort cgroups v2 resource limits when available
-- **ARM64 binary emulation via `qemu-aarch64`** (v0.7.0+)
+- **ARM64 binary emulation via `qemu-aarch64`** (v0.7.1+)
 
 Network access is blocked by default.
 
@@ -140,7 +140,7 @@ lure diff REPORT1 REPORT2
 
 ## Changelog
 
-### v0.7.0
+### v0.7.1
 - **ARM64 binary support** via `qemu-aarch64` user-mode emulation
 - `lure inspect` correctly displays `ARM64` for AArch64 ELFs
 - `lure run` auto-detects ARM64 ELFs and wraps execution with `qemu-aarch64`
